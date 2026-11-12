@@ -1399,6 +1399,33 @@ function App() {
     try { localStorage.setItem(ACTIVE_LOCATION_KEY, locationId); } catch (e) { /* ignore */ }
   };
 
+  // One-time read of stock items and movements for several locations
+  // (used by the Inventory "All my locations" report). A location that
+  // cannot be read is returned with an error instead of failing the rest.
+  const loadLocationStock = async (ids) => {
+    const db = dbApiRef.current;
+    if (dbModeRef.current !== "firebase" || !db) {
+      throw new Error("Reports across locations need Firebase mode.");
+    }
+
+    return Promise.all(ids.map(async (locationId) => {
+      try {
+        const [itemsSnap, movesSnap] = await Promise.all([
+          getLocationCollection(db, locationId, "stockItems").get(),
+          getLocationCollection(db, locationId, "stockMovements").get(),
+        ]);
+        return {
+          locationId,
+          items: itemsSnap.docs.map((d) => ({ ...d.data(), id: d.id })),
+          movements: movesSnap.docs.map((d) => ({ ...d.data(), id: d.id })),
+        };
+      } catch (e) {
+        console.error("Stock load failed for", locationId, e);
+        return { locationId, items: [], movements: [], error: describeFirestoreError(e, "read stock") };
+      }
+    }));
+  };
+
   // FIREBASE MODE: live subscriptions for the active location only.
   // Re-runs (and cleanly unsubscribes) when the location changes or the
   // user signs out.
@@ -1600,7 +1627,12 @@ function getLocationCollection(db, locationId, collectionName) {
         )}
         {view === "inventory" && (
           <InventoryScreen session={session} stockItems={stockItems} stockMovements={stockMovements}
-            persistStockItems={persist.stockItems} persistStockMovements={persist.stockMovements} notify={notify} />
+            persistStockItems={persist.stockItems} persistStockMovements={persist.stockMovements} notify={notify}
+            settings={settings} activeLocationId={activeLocationId} locationIds={Array.isArray(session.locationIds) ? session.locationIds : []}
+            loadLocationStock={dbModeRef.current === "firebase" ? loadLocationStock : undefined} />
+        )}
+        {view === "sealreg" && canUseSealRegister(session) && (
+          <SealRegisterScreen session={session} getDb={() => dbApiRef.current} firebaseMode={dbModeRef.current === "firebase"} notify={notify} />
         )}
         {view === "handover" && (
           <HandoverScreen session={session} users={users} handoverItems={handoverItems} handoverRecords={handoverRecords}
@@ -1662,7 +1694,7 @@ function getLocationCollection(db, locationId, collectionName) {
           />
         )}
       </main>
-      <BottomNav view={view} setView={setView} role={session.role} />
+      <BottomNav view={view} setView={setView} role={session.role} canSealRegister={canUseSealRegister(session)} />
     </div>
   );
 }
@@ -1727,7 +1759,7 @@ function Header({ session, onLogout, syncMode, canWriteShared, activeLocationId,
   );
 }
 
-function BottomNav({ view, setView, role }) {
+function BottomNav({ view, setView, role, canSealRegister }) {
   const items = [
     { id: "dashboard", label: "Dashboard", icon: Home, roles: ["admin", "guard"] },
     { id: "checkin", label: "Check In", icon: DoorOpen, roles: ["admin", "guard"] },
@@ -1738,12 +1770,13 @@ function BottomNav({ view, setView, role }) {
     { id: "visitors", label: "Visitors", icon: UserPlus, roles: ["admin", "guard"] },
     { id: "inventory", label: "Inventory", icon: Package, roles: ["admin", "guard"] },
     { id: "shipments", label: "Shipments", icon: Truck, roles: ["admin", "guard"] },
+    { id: "sealreg", label: "Seal Register", icon: ShieldCheck, roles: ["admin", "guard"], show: !!canSealRegister },
     { id: "handover", label: "Handover", icon: RefreshCw, roles: ["admin", "guard"] },
     { id: "incidents", label: "Incidents", icon: AlertTriangle, roles: ["admin", "guard"] },
     { id: "employees", label: "Employees", icon: Users, roles: ["admin"] },
     { id: "reports", label: "Reports", icon: BarChart3, roles: ["admin"] },
     { id: "settings", label: "Settings", icon: SettingsIcon, roles: ["admin"] },
-  ].filter((i) => i.roles.includes(role));
+  ].filter((i) => i.roles.includes(role) && i.show !== false);
 
   return (
     <nav className="no-print" style={{
@@ -3023,7 +3056,7 @@ function VisitorForm({ onClose, onSave }) {
    wrapping materials, etc.), with a per-item reorder threshold so low
    stock surfaces on the dashboard instead of being discovered too late.
 --------------------------------------------------------------------- */
-function InventoryScreen({ session, stockItems, stockMovements, persistStockItems, persistStockMovements, notify }) {
+function InventoryScreen({ session, stockItems, stockMovements, persistStockItems, persistStockMovements, notify, settings, activeLocationId, locationIds, loadLocationStock }) {
   const [tab, setTab] = useState("items");
   const [showItemForm, setShowItemForm] = useState(false);
   const [showMoveForm, setShowMoveForm] = useState(null); // null | {item, type}
@@ -3094,7 +3127,7 @@ function InventoryScreen({ session, stockItems, stockMovements, persistStockItem
       )}
 
       <div style={{ display: "flex", gap: 6, marginBottom: 12 }}>
-        {[["items", "Items"], ["history", "Movement History"]].map(([k, label]) => (
+        {[["items", "Items"], ["history", "Movement History"], ...(session.role === "admin" ? [["insights", "Usage & Reports"]] : [])].map(([k, label]) => (
           <button key={k} onClick={() => setTab(k)} style={{
             padding: "7px 12px", borderRadius: 20, fontSize: 12.5, fontWeight: 600, cursor: "pointer",
             border: `1px solid ${tab === k ? C.navy : C.line}`, background: tab === k ? C.navy : "#fff", color: tab === k ? "#fff" : C.ink,
@@ -3102,7 +3135,9 @@ function InventoryScreen({ session, stockItems, stockMovements, persistStockItem
         ))}
       </div>
 
-      {tab === "items" ? (
+      {tab === "insights" && session.role === "admin" ? (
+        <InventoryInsights settings={settings} stockItems={stockItems} stockMovements={stockMovements} activeLocationId={activeLocationId} locationIds={locationIds} loadLocationStock={loadLocationStock} notify={notify} />
+      ) : tab === "items" ? (
         <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
           {withLevels.length === 0 ? <EmptyState icon={Package} title="No inventory items yet" sub={session.role === "admin" ? "Tap + Add Item to start tracking stock" : "Ask admin to add items to track"} /> : (
             withLevels.sort((a, b) => (a.level <= a.min_threshold ? -1 : 1) - (b.level <= b.min_threshold ? -1 : 1)).map((i) => (
@@ -3159,6 +3194,815 @@ function InventoryScreen({ session, stockItems, stockMovements, persistStockItem
       )}
       {showMoveForm && (
         <StockMovementForm item={showMoveForm.item} type={showMoveForm.type} onClose={() => setShowMoveForm(null)} onSave={logMovement} />
+      )}
+    </div>
+  );
+}
+
+/* ---------------------------------------------------------------------
+   SEAL REGISTER — Loading Area vehicle & seal log (Loading Area guards + admin)
+   Vehicles arriving (IN) and leaving (OUT): seal photo, seal number (read from
+   the photo as a suggestion the guard confirms), seal condition, driver,
+   from/to, chamber, optional shipment count, and an alert email draft.
+   Data: locations/DFC-Loading-Area/loadingLogs  (one small record per vehicle)
+         locations/DFC-Loading-Area/loadingPhotos (the photo, read only on demand)
+         locations/DFC-Loading-Area/config/sealRegister (alert emails per chamber)
+--------------------------------------------------------------------- */
+const SEAL_LOCATION_ID = "DFC-Loading-Area";
+const SEAL_CHAMBERS = ["DFC-101", "DFC-102", "DFC-107", "DFC-109"];
+
+function canUseSealRegister(session) {
+  if (!session) return false;
+  if (session.role === "admin") return true;
+  return Array.isArray(session.locationIds) && session.locationIds.includes(SEAL_LOCATION_ID);
+}
+
+function loadExternalScript(src, isReady) {
+  if (isReady && isReady()) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    const el = document.createElement("script");
+    el.src = src; el.async = true;
+    el.onload = () => resolve();
+    el.onerror = () => reject(new Error("Could not load the number-reading tool (check the internet connection)."));
+    document.head.appendChild(el);
+  });
+}
+
+// Shrinks a camera photo so it fits comfortably in one Firestore document.
+function compressImageFile(file, maxSide = 1280) {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file);
+    const img = new Image();
+    img.onload = () => {
+      try {
+        const scale = Math.min(1, maxSide / Math.max(img.width, img.height));
+        const canvas = document.createElement("canvas");
+        canvas.width = Math.max(1, Math.round(img.width * scale));
+        canvas.height = Math.max(1, Math.round(img.height * scale));
+        canvas.getContext("2d").drawImage(img, 0, 0, canvas.width, canvas.height);
+        let quality = 0.72;
+        let out = canvas.toDataURL("image/jpeg", quality);
+        while (out.length > 700000 && quality > 0.4) { quality -= 0.08; out = canvas.toDataURL("image/jpeg", quality); }
+        URL.revokeObjectURL(url);
+        resolve(out);
+      } catch (e) { URL.revokeObjectURL(url); reject(e); }
+    };
+    img.onerror = () => { URL.revokeObjectURL(url); reject(new Error("Could not read this photo. Please try again.")); };
+    img.src = url;
+  });
+}
+
+// Pulls likely seal numbers (5-20 letters/digits with at least 3 digits) out of OCR text.
+function extractSealCandidates(text) {
+  const tokens = String(text || "").toUpperCase().split(/[^A-Z0-9-]+/).map((t) => t.replace(/^-+|-+$/g, "")).filter(Boolean);
+  const digits = (t) => (t.match(/\d/g) || []).length;
+  const good = Array.from(new Set(tokens.filter((t) => t.length >= 5 && t.length <= 20 && digits(t) >= 3)));
+  good.sort((a, b) => (digits(b) - digits(a)) || (b.length - a.length));
+  return good.slice(0, 5);
+}
+
+// Reads text from the photo in the browser (Tesseract.js, loaded only when used).
+// Reuses the app's image preparation (upscale, grayscale, contrast) and runs two passes.
+async function readSealCandidates(file) {
+  await loadExternalScript("https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js", () => window.Tesseract);
+  const run = (async () => {
+    const blob = await prepareImageForOcr(file);
+    const worker = await window.Tesseract.createWorker("eng");
+    try {
+      let text = "";
+      for (const psm of ["11", "6"]) {
+        try {
+          await worker.setParameters({ tessedit_char_whitelist: "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-", tessedit_pageseg_mode: psm });
+        } catch (e) { /* older builds */ }
+        const res = await worker.recognize(blob);
+        text += "\n" + ((res && res.data && res.data.text) || "");
+      }
+      return { text, candidates: extractSealCandidates(text) };
+    } finally {
+      try { await worker.terminate(); } catch (e) { /* ignore */ }
+    }
+  })();
+  const timeout = new Promise((_, reject) => setTimeout(() => reject(new Error("Reading the photo took too long.")), 90000));
+  return Promise.race([run, timeout]);
+}
+
+function sealAlertMessage(rec) {
+  const isIn = rec.direction === "IN";
+  const broken = rec.seal_status === "BROKEN";
+  const subject = `${broken ? "BROKEN SEAL — " : ""}Vehicle ${isIn ? "arrived at" : "left"} ${SEAL_LOCATION_ID} — seal ${rec.seal_number}`;
+  const lines = [
+    isIn ? "VEHICLE ARRIVED — SEAL CHECKED" : "VEHICLE DEPARTING — SEAL RECORDED",
+    "",
+    `Seal number: ${rec.seal_number}`,
+    `Seal condition: ${broken ? "BROKEN — please investigate" : "Intact"}`,
+    `Driver: ${rec.driver_name}`,
+    rec.vehicle_number ? `Vehicle number: ${rec.vehicle_number}` : "",
+    isIn ? `Coming from: ${rec.origin}` : `Shipment from: ${rec.department}`,
+    isIn ? `Shipment for: ${rec.department}` : `Going to: ${rec.destination}`,
+    rec.shipment_count != null && rec.shipment_count !== "" ? `Number of shipments: ${rec.shipment_count}` : "",
+    rec.remarks ? `Remarks: ${rec.remarks}` : "",
+    `Date/time: ${fmtDate(rec.date)} ${fmtTime(rec.time)}`,
+    `Recorded by: ${rec.recorded_by}`,
+    rec.has_photo ? "The seal photo is saved in the Seal Register." : "",
+    "", "Sent from the Aramex Gatehouse Register app.",
+  ].filter((l, i, arr) => l !== "" || (arr[i - 1] !== "" && i > 0));
+  return { subject, body: lines.join("\n") };
+}
+
+function SealForm({ direction, onClose, onSave }) {
+  const isIn = direction === "IN";
+  const fileRef = useRef(null);
+  const [photo, setPhoto] = useState(null);
+  const [reading, setReading] = useState(false);
+  const [readMsg, setReadMsg] = useState("");
+  const [candidates, setCandidates] = useState([]);
+  const [ocrText, setOcrText] = useState("");
+  const [sealNumber, setSealNumber] = useState("");
+  const [sealStatus, setSealStatus] = useState("");
+  const [driver, setDriver] = useState("");
+  const [vehicle, setVehicle] = useState("");
+  const [origin, setOrigin] = useState("");
+  const [destination, setDestination] = useState("");
+  const [chamber, setChamber] = useState("");
+  const [shipments, setShipments] = useState("");
+  const [remarks, setRemarks] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+
+  const onPhoto = async (e) => {
+    const file = e.target.files && e.target.files[0];
+    e.target.value = "";
+    if (!file) return;
+    setError(""); setReadMsg(""); setCandidates([]);
+    let compressed;
+    try { compressed = await compressImageFile(file); } catch (err) { setError(err.message || "Could not read this photo."); return; }
+    setPhoto(compressed);
+    setReading(true);
+    try {
+      const res = await readSealCandidates(file);
+      setOcrText(res.text);
+      setCandidates(res.candidates);
+      if (res.candidates.length) {
+        setSealNumber((cur) => cur || res.candidates[0]);
+        setReadMsg("Number read from the photo — check it matches the seal, or tap another suggestion.");
+      } else {
+        setReadMsg("Could not read a number from this photo. Type the seal number, or retake the photo closer.");
+      }
+    } catch (err) {
+      setReadMsg((err && err.message) || "Could not read the photo automatically. Type the seal number.");
+    } finally {
+      setReading(false);
+    }
+  };
+
+  const submit = async () => {
+    const seal = sealNumber.trim().toUpperCase();
+    if (seal.length < 3) { setError("Enter the seal number."); return; }
+    if (!sealStatus) { setError("Choose whether the seal is intact or broken."); return; }
+    if (!driver.trim()) { setError("Enter the driver's name."); return; }
+    if (!chamber) { setError(isIn ? "Choose which chamber the shipment is for." : "Choose which chamber the shipment is from."); return; }
+    if (isIn && !origin.trim()) { setError("Enter where the vehicle is coming from."); return; }
+    if (!isIn && !destination.trim()) { setError("Enter where the vehicle is going."); return; }
+    const count = shipments === "" ? null : Number(shipments);
+    if (count !== null && (!Number.isFinite(count) || count < 0)) { setError("Number of shipments must be 0 or more."); return; }
+    setError(""); setSaving(true);
+    try {
+      await onSave({
+        direction, seal_number: seal, seal_status: sealStatus, driver_name: driver.trim(), vehicle_number: vehicle.trim().toUpperCase(),
+        department: chamber, origin: isIn ? origin.trim() : "", destination: isIn ? "" : destination.trim(),
+        shipment_count: count, remarks: remarks.trim(), ocr_text: ocrText,
+      }, photo);
+    } catch (e) {
+      setSaving(false); // the failed save already showed an error message
+    }
+  };
+
+  const choice = (value, label, activeBg) => (
+    <button type="button" key={value} onClick={() => setSealStatus(value)} style={{
+      flex: 1, padding: "12px 10px", borderRadius: 8, cursor: "pointer", fontWeight: 700, fontSize: 14.5, fontFamily: FONT_SANS,
+      border: `2px solid ${sealStatus === value ? activeBg : C.line}`, background: sealStatus === value ? activeBg : "#fff", color: sealStatus === value ? "#fff" : C.ink,
+    }}>{label}</button>
+  );
+
+  return (
+    <Modal title={isIn ? "Vehicle IN — check the seal" : "Vehicle OUT — record the seal"} onClose={onClose}>
+      <input ref={fileRef} type="file" accept="image/*" capture="environment" onChange={onPhoto} style={{ display: "none" }} data-testid="seal-photo-input" />
+      <div style={{ marginBottom: 12 }}>
+        {photo && <img src={photo} alt="Seal" style={{ width: "100%", maxHeight: 220, objectFit: "contain", borderRadius: 8, border: `1px solid ${C.line}`, background: "#000", marginBottom: 8 }} />}
+        <Btn tone={photo ? "paper" : "navy"} icon={Camera} full onClick={() => fileRef.current && fileRef.current.click()} disabled={reading}>
+          {reading ? "Reading the seal number…" : photo ? "Retake photo" : "Scan seal (take photo)"}
+        </Btn>
+        {!photo && <div style={{ fontSize: 11.5, color: C.amberDeep, marginTop: 6 }}>No photo yet — a photo is saved with the record and used to read the number.</div>}
+        {readMsg && <div style={{ fontSize: 12, color: C.ink50, marginTop: 6, lineHeight: 1.5 }}>{readMsg}</div>}
+        {candidates.length > 1 && (
+          <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginTop: 6 }}>
+            {candidates.map((c) => (
+              <button type="button" key={c} onClick={() => setSealNumber(c)} style={{ fontFamily: FONT_MONO, fontSize: 12, padding: "4px 8px", borderRadius: 6, border: `1px solid ${C.line}`, background: sealNumber === c ? C.navy : "#fff", color: sealNumber === c ? "#fff" : C.ink, cursor: "pointer" }}>{c}</button>
+            ))}
+          </div>
+        )}
+      </div>
+
+      <Field label="Seal number *">
+        <input style={{ ...inputStyle, fontFamily: FONT_MONO, fontSize: 17, letterSpacing: 1 }} value={sealNumber} onChange={(e) => setSealNumber(e.target.value.toUpperCase())} placeholder="Type or confirm the number" autoCapitalize="characters" />
+      </Field>
+      <div style={{ marginBottom: 12 }} role="group" aria-label="Seal condition">
+        <div style={{ fontSize: 12.5, fontFamily: FONT_SANS, fontWeight: 600, color: C.ink50, marginBottom: 5 }}>Seal condition *</div>
+        <div style={{ display: "flex", gap: 8 }}>{choice("INTACT", "Intact (OK)", "#1F7A4D")}{choice("BROKEN", "Broken / tampered", "#B3261E")}</div>
+        {sealStatus === "BROKEN" && <div style={{ fontSize: 12, color: C.redDeep, marginTop: 6 }}>A broken seal is flagged in red. Add details in Remarks and notify the concerned people after saving.</div>}
+      </div>
+      <Field label="Driver name *"><input style={inputStyle} value={driver} onChange={(e) => setDriver(e.target.value)} /></Field>
+      <Field label="Vehicle number"><input style={inputStyle} value={vehicle} onChange={(e) => setVehicle(e.target.value)} autoCapitalize="characters" /></Field>
+      {isIn ? (
+        <Field label="Coming from *"><input style={inputStyle} value={origin} onChange={(e) => setOrigin(e.target.value)} placeholder="City / sender / branch" /></Field>
+      ) : (
+        <Field label="Going to *"><input style={inputStyle} value={destination} onChange={(e) => setDestination(e.target.value)} placeholder="City / receiver / branch" /></Field>
+      )}
+      <Field label={isIn ? "Shipment is for chamber *" : "Shipment is from chamber *"}>
+        <select style={inputStyle} value={chamber} onChange={(e) => setChamber(e.target.value)}>
+          <option value="">Choose…</option>
+          {SEAL_CHAMBERS.map((c) => <option key={c} value={c}>{c}</option>)}
+        </select>
+      </Field>
+      <Field label="Number of shipments (optional)"><input type="number" min="0" style={inputStyle} value={shipments} onChange={(e) => setShipments(e.target.value)} /></Field>
+      <Field label="Remarks (optional)"><input style={inputStyle} value={remarks} onChange={(e) => setRemarks(e.target.value)} /></Field>
+
+      {error && <div style={{ background: "#FDE8E8", border: "1px solid #F5B5B5", borderRadius: 8, padding: "9px 12px", fontSize: 13, color: C.redDeep, marginBottom: 12 }}>{error}</div>}
+      <Btn tone={isIn ? "green" : "navy"} full onClick={submit} disabled={saving || reading}>{saving ? "Saving…" : "Save record"}</Btn>
+    </Modal>
+  );
+}
+
+function SealRegisterScreen({ session, getDb, firebaseMode, notify }) {
+  const isAdmin = session.role === "admin";
+  const hasAccess = firebaseMode && Array.isArray(session.locationIds) && session.locationIds.includes(SEAL_LOCATION_ID);
+  const base = `locations/${SEAL_LOCATION_ID}`;
+
+  const [logs, setLogs] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState("");
+  const [recipients, setRecipients] = useState({});
+  const [showForm, setShowForm] = useState(null); // "IN" | "OUT" | null
+  const [saved, setSaved] = useState(null);
+  const [photoView, setPhotoView] = useState(null); // { log, image, error, loading }
+  const [showEmails, setShowEmails] = useState(false);
+  const [dirFilter, setDirFilter] = useState("ALL");
+  const [chamberFilter, setChamberFilter] = useState("");
+  const [preset, setPreset] = useState("week");
+  const [search, setSearch] = useState("");
+  const [notifyTo, setNotifyTo] = useState("");
+
+  useEffect(() => {
+    if (!hasAccess) { setLoading(false); return undefined; }
+    const db = getDb();
+    if (!db) { setLoading(false); return undefined; }
+    let cancelled = false;
+    setLoading(true); setLoadError("");
+
+    const stopLogs = db.collection(`${base}/loadingLogs`).orderBy("created_at", "desc").limit(300).onSnapshot(
+      (snap) => { if (cancelled) return; setLogs(snap.docs.map((d) => ({ ...d.data(), id: d.id }))); setLoading(false); },
+      (err) => { if (cancelled) return; console.error("Seal register read failed:", err); setLoadError(describeFirestoreError(err, "read the Seal Register")); setLoading(false); }
+    );
+    const stopCfg = db.doc(`${base}/config/sealRegister`).onSnapshot(
+      (snap) => { if (!cancelled) setRecipients((snap.exists && snap.data() && snap.data().recipients) || {}); },
+      () => { /* alert emails are optional */ }
+    );
+    return () => { cancelled = true; try { stopLogs(); } catch (e) { /* ignore */ } try { stopCfg(); } catch (e) { /* ignore */ } };
+  }, [hasAccess]);
+
+  if (!firebaseMode) {
+    return <EmptyState icon={ShieldCheck} title="Seal Register needs Firebase mode" sub="Connect this device to Firebase (Settings) to use the Seal Register." />;
+  }
+  if (!hasAccess) {
+    return <EmptyState icon={ShieldCheck} title="Seal Register is not available for your account" sub={`Your account needs access to ${SEAL_LOCATION_ID}. Ask the administrator to add it to your staff profile.`} />;
+  }
+
+  const saveRecord = async (fields, photoDataUrl) => {
+    const db = getDb();
+    const now = new Date();
+    const id = uid("sr_");
+    const rec = {
+      id, ...fields, has_photo: !!photoDataUrl,
+      date: todayStr(now), time: nowTimeStr(now), recorded_by: session.name, recorded_by_id: session.id, created_at: Date.now(),
+    };
+    try {
+      if (photoDataUrl) await db.doc(`${base}/loadingPhotos/${id}`).set({ id, log_id: id, image: photoDataUrl, created_at: rec.created_at });
+      await db.doc(`${base}/loadingLogs/${id}`).set(cleanForStore(rec));
+    } catch (e) {
+      console.error("Seal register save failed:", e);
+      notify(describeFirestoreError(e, "save this record"), "error");
+      throw e;
+    }
+    setShowForm(null);
+    setNotifyTo(recipients[rec.department] || "");
+    setSaved(rec);
+    if (rec.seal_status === "BROKEN") notify("Broken seal recorded — notify the concerned people", "error");
+    else notify("Record saved");
+  };
+
+  const sendAlert = (rec, to) => {
+    if (!String(to || "").trim()) { notify("Enter the email address to notify", "error"); return; }
+    const m = sealAlertMessage(rec);
+    openMailDraft(to, m.subject, m.body);
+    notify("Alert ready — check your email app");
+  };
+
+  const openPhoto = async (log) => {
+    setPhotoView({ log, image: null, error: "", loading: true });
+    try {
+      const snap = await getDb().doc(`${base}/loadingPhotos/${log.id}`).get();
+      setPhotoView({ log, image: snap.exists ? snap.data().image : null, error: snap.exists ? "" : "No photo was saved for this record.", loading: false });
+    } catch (e) {
+      setPhotoView({ log, image: null, error: describeFirestoreError(e, "load the photo"), loading: false });
+    }
+  };
+
+  const saveEmails = async (map) => {
+    try {
+      await getDb().doc(`${base}/config/sealRegister`).set({ recipients: map });
+      notify("Alert emails saved");
+      setShowEmails(false);
+    } catch (e) {
+      notify(describeFirestoreError(e, "save the alert emails"), "error");
+    }
+  };
+
+  const range = preset === "all" ? null : inventoryPresetRange(preset);
+  const q = search.trim().toLowerCase();
+  const shown = logs.filter((l) => {
+    if (dirFilter !== "ALL" && l.direction !== dirFilter) return false;
+    if (chamberFilter && l.department !== chamberFilter) return false;
+    if (range && (l.date < range.from || l.date > range.to)) return false;
+    if (q && ![l.seal_number, l.driver_name, l.vehicle_number, l.origin, l.destination, l.remarks].some((v) => String(v || "").toLowerCase().includes(q))) return false;
+    return true;
+  });
+  const countIn = shown.filter((l) => l.direction === "IN").length;
+  const countOut = shown.filter((l) => l.direction === "OUT").length;
+  const countBroken = shown.filter((l) => l.seal_status === "BROKEN").length;
+
+  const exportCsv = () => {
+    if (!shown.length) { notify("Nothing to export for these filters", "error"); return; }
+    const headers = [
+      { label: "Date", get: (r) => r.date }, { label: "Time", get: (r) => r.time }, { label: "Direction", get: (r) => r.direction },
+      { label: "Seal Number", get: (r) => r.seal_number }, { label: "Seal Condition", get: (r) => r.seal_status }, { label: "Driver", get: (r) => r.driver_name },
+      { label: "Vehicle", get: (r) => r.vehicle_number || "" }, { label: "Chamber", get: (r) => r.department }, { label: "Coming From", get: (r) => r.origin || "" },
+      { label: "Going To", get: (r) => r.destination || "" }, { label: "Shipments", get: (r) => (r.shipment_count == null ? "" : r.shipment_count) },
+      { label: "Remarks", get: (r) => r.remarks || "" }, { label: "Photo Saved", get: (r) => (r.has_photo ? "Yes" : "No") }, { label: "Recorded By", get: (r) => r.recorded_by || "" },
+    ];
+    downloadFile(`seal-register-${todayStr()}.csv`, toCSV(shown, headers), "text/csv");
+  };
+
+  const pill = (active, onClick, label) => (
+    <button key={label} onClick={onClick} style={{ padding: "6px 11px", borderRadius: 16, fontSize: 12, fontWeight: 600, cursor: "pointer", border: `1px solid ${active ? C.navy : C.line}`, background: active ? C.navy : "#fff", color: active ? "#fff" : C.ink }}>{label}</button>
+  );
+
+  return (
+    <div>
+      <SectionTitle title="Seal Register" sub={`${SEAL_LOCATION_ID} · vehicles IN and OUT`} />
+
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginBottom: 14 }}>
+        <Btn tone="green" size="lg" icon={DoorOpen} onClick={() => setShowForm("IN")}>Vehicle IN</Btn>
+        <Btn tone="navy" size="lg" icon={DoorClosed} onClick={() => setShowForm("OUT")}>Vehicle OUT</Btn>
+      </div>
+
+      <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 8 }}>
+        {[["ALL", "All"], ["IN", "IN"], ["OUT", "OUT"]].map(([k, label]) => pill(dirFilter === k, () => setDirFilter(k), label))}
+        {[["today", "Today"], ["week", "This week"], ["month", "This month"], ["all", "All time"]].map(([k, label]) => pill(preset === k, () => setPreset(k), label))}
+      </div>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 10 }}>
+        <select style={inputStyle} value={chamberFilter} onChange={(e) => setChamberFilter(e.target.value)} aria-label="Chamber">
+          <option value="">All chambers</option>
+          {SEAL_CHAMBERS.map((c) => <option key={c} value={c}>{c}</option>)}
+        </select>
+        <input style={inputStyle} value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search seal, driver, vehicle…" />
+      </div>
+
+      <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center", marginBottom: 10, fontSize: 12.5, color: C.ink50 }}>
+        <span><b style={{ color: C.ink }}>{countIn}</b> IN</span>·<span><b style={{ color: C.ink }}>{countOut}</b> OUT</span>·
+        <span><b style={{ color: countBroken ? C.redDeep : C.ink }}>{countBroken}</b> broken seal(s)</span>
+        {isAdmin && <span style={{ marginLeft: "auto", display: "flex", gap: 6 }}>
+          <Btn size="sm" tone="paper" icon={FileDown} onClick={exportCsv}>CSV</Btn>
+          <Btn size="sm" tone="paper" onClick={() => setShowEmails(true)}>Alert emails</Btn>
+        </span>}
+      </div>
+
+      {loadError && <div style={{ background: "#FDE8E8", border: "1px solid #F5B5B5", borderRadius: 8, padding: "9px 12px", fontSize: 12.5, color: C.redDeep, marginBottom: 12 }}>{loadError}</div>}
+
+      <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+        {loading ? <div style={{ fontSize: 13, color: C.ink50, padding: 8 }}>Loading…</div> : shown.length === 0 ? (
+          <EmptyState icon={Truck} title="No records for these filters" sub="Tap Vehicle IN or Vehicle OUT to record one" />
+        ) : shown.map((l) => {
+          const broken = l.seal_status === "BROKEN";
+          const isIn = l.direction === "IN";
+          return (
+            <div key={l.id} style={{ background: "#fff", border: `1px solid ${broken ? "#E9C3BE" : C.line}`, borderLeft: `4px solid ${broken ? "#B3261E" : isIn ? "#1F7A4D" : C.navy}`, borderRadius: 10, padding: "12px 14px" }}>
+              <div style={{ display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap" }}>
+                <Badge tone={isIn ? "inside" : "out"}>{l.direction}</Badge>
+                <Badge tone={broken ? "missing" : "inside"}>{broken ? "SEAL BROKEN" : "SEAL INTACT"}</Badge>
+                <span style={{ marginLeft: "auto", fontSize: 11.5, color: C.ink50 }}>{fmtDate(l.date)} {fmtTime(l.time)}</span>
+              </div>
+              <div style={{ fontFamily: FONT_MONO, fontWeight: 700, fontSize: 17, color: C.ink, marginTop: 8, letterSpacing: 0.5 }}>{l.seal_number}</div>
+              <div style={{ fontSize: 13, color: C.ink, marginTop: 4 }}>{l.driver_name}{l.vehicle_number ? ` · ${l.vehicle_number}` : ""}</div>
+              <div style={{ fontSize: 12.5, color: C.ink50, marginTop: 3 }}>
+                {isIn ? `From ${l.origin} → for ${l.department}` : `From ${l.department} → to ${l.destination}`}
+                {l.shipment_count != null && l.shipment_count !== "" ? ` · ${l.shipment_count} shipment(s)` : ""}
+              </div>
+              {l.remarks && <div style={{ fontSize: 12.5, color: C.ink50, marginTop: 3 }}>{l.remarks}</div>}
+              <div style={{ display: "flex", gap: 8, marginTop: 10, alignItems: "center" }}>
+                {l.has_photo && <Btn size="sm" tone="paper" icon={Eye} onClick={() => openPhoto(l)}>Photo</Btn>}
+                <Btn size="sm" tone="paper" onClick={() => { setNotifyTo(recipients[l.department] || ""); setSaved(l); }}>Notify</Btn>
+                <span style={{ marginLeft: "auto", fontSize: 11.5, color: C.ink50 }}>by {l.recorded_by}</span>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+
+      {showForm && <SealForm direction={showForm} onClose={() => setShowForm(null)} onSave={saveRecord} />}
+
+      {saved && (
+        <Modal title="Notify the concerned people" onClose={() => setSaved(null)}>
+          <div style={{ background: saved.seal_status === "BROKEN" ? "#F7E7E5" : "#EAF5EE", border: `1px solid ${saved.seal_status === "BROKEN" ? "#E9C3BE" : "#BFE0CB"}`, borderRadius: 8, padding: "10px 12px", fontSize: 13, marginBottom: 12, color: C.ink }}>
+            <b>{saved.direction === "IN" ? "Vehicle IN" : "Vehicle OUT"}</b> · seal <b style={{ fontFamily: FONT_MONO }}>{saved.seal_number}</b> · {saved.seal_status === "BROKEN" ? "BROKEN" : "intact"} · {saved.department}
+          </div>
+          <Field label={`Send to (email) — ${saved.department}`}>
+            <input type="email" style={inputStyle} value={notifyTo} onChange={(e) => setNotifyTo(e.target.value)} placeholder="name@company.com, other@company.com" />
+          </Field>
+          <Btn tone="navy" full icon={Download} onClick={() => sendAlert(saved, notifyTo)}>Open email with the alert</Btn>
+          <div style={{ fontSize: 11.5, color: C.ink50, marginTop: 8, lineHeight: 1.5 }}>Opens your email app with the details filled in. The seal photo stays saved in the register.</div>
+        </Modal>
+      )}
+
+      {photoView && (
+        <Modal title={`Seal ${photoView.log.seal_number}`} onClose={() => setPhotoView(null)} wide>
+          {photoView.loading ? <div style={{ fontSize: 13, color: C.ink50 }}>Loading photo…</div>
+            : photoView.image ? <img src={photoView.image} alt="Seal" style={{ width: "100%", borderRadius: 8 }} />
+            : <div style={{ fontSize: 13, color: C.redDeep }}>{photoView.error}</div>}
+        </Modal>
+      )}
+
+      {showEmails && <SealEmailsModal recipients={recipients} onSave={saveEmails} onClose={() => setShowEmails(false)} />}
+    </div>
+  );
+}
+
+function SealEmailsModal({ recipients, onSave, onClose }) {
+  const [map, setMap] = useState(() => Object.fromEntries(SEAL_CHAMBERS.map((c) => [c, recipients[c] || ""])));
+  return (
+    <Modal title="Alert emails per chamber" onClose={onClose}>
+      <div style={{ fontSize: 12.5, color: C.ink50, marginBottom: 12, lineHeight: 1.5 }}>Who should be notified when a vehicle's shipment is for, or leaves, each chamber. Separate several addresses with commas.</div>
+      {SEAL_CHAMBERS.map((c) => (
+        <Field key={c} label={c}><input type="text" style={inputStyle} value={map[c]} onChange={(e) => setMap({ ...map, [c]: e.target.value })} placeholder="name@company.com" /></Field>
+      ))}
+      <Btn tone="navy" full onClick={() => onSave(map)}>Save</Btn>
+    </Modal>
+  );
+}
+
+/* ---------------------------------------------------------------------
+   INVENTORY — USAGE & LOW-STOCK REPORTS (admin)
+   Filters by location, item, in/out, date range and person/company; per-item
+   usage totals; CSV export; email drafts; and a low-stock refill report.
+   Email: this app has no server, so "email" opens the device's email app with
+   the report filled in and downloads the CSV to attach.
+--------------------------------------------------------------------- */
+function openMailDraft(to, subject, body) {
+  const addresses = String(to).split(/[;,]/).map((x) => x.trim()).filter(Boolean).map(encodeURIComponent).join(",");
+  const mailto = `mailto:${addresses}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
+  const a = document.createElement("a");
+  a.href = mailto; a.target = "_blank";
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+}
+
+function inventoryPresetRange(preset) {
+  const now = new Date();
+  if (preset === "today") return { from: todayStr(now), to: todayStr(now) };
+  if (preset === "week") return { from: todayStr(startOfWeek(now)), to: todayStr(now) };
+  if (preset === "month") return { from: todayStr(new Date(now.getFullYear(), now.getMonth(), 1)), to: todayStr(now) };
+  if (preset === "lastmonth") {
+    return { from: todayStr(new Date(now.getFullYear(), now.getMonth() - 1, 1)), to: todayStr(new Date(now.getFullYear(), now.getMonth(), 0)) };
+  }
+  if (preset === "30days") { const d = new Date(now); d.setDate(d.getDate() - 29); return { from: todayStr(d), to: todayStr(now) }; }
+  return null;
+}
+
+function InventoryInsights({ settings, stockItems, stockMovements, activeLocationId, locationIds, loadLocationStock, notify }) {
+  const canAll = typeof loadLocationStock === "function" && Array.isArray(locationIds) && locationIds.length > 1;
+  const initialRange = inventoryPresetRange("month");
+  const savedRecipient = (((settings || {}).report_channels || {}).inventory || {}).recipient_email || "";
+
+  const [view, setView] = useState("usage"); // usage | low
+  const [scope, setScope] = useState("current"); // current | all
+  const [preset, setPreset] = useState("month");
+  const [from, setFrom] = useState(initialRange.from);
+  const [to, setTo] = useState(initialRange.to);
+  const [itemName, setItemName] = useState("");
+  const [typeFilter, setTypeFilter] = useState("ALL");
+  const [search, setSearch] = useState("");
+  const [remote, setRemote] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [loadError, setLoadError] = useState("");
+  const [refreshKey, setRefreshKey] = useState(0);
+  const [sendTo, setSendTo] = useState(savedRecipient);
+
+  // "All my locations": one-time read of every location this user may access.
+  useEffect(() => {
+    if (scope !== "all" || !canAll) return undefined;
+    let cancelled = false;
+    setLoading(true); setLoadError("");
+    loadLocationStock(locationIds)
+      .then((res) => { if (!cancelled) { setRemote(res); setLoading(false); } })
+      .catch((e) => { if (!cancelled) { setLoadError((e && e.message) || "Could not load stock."); setLoading(false); } });
+    return () => { cancelled = true; };
+  }, [scope, refreshKey]);
+
+  const failedLocations = scope === "all" && remote ? remote.filter((r) => r.error) : [];
+  const dataSets = useMemo(() => {
+    if (scope === "all") return remote ? remote.filter((r) => !r.error) : [];
+    return [{ locationId: activeLocationId || "This location", items: stockItems, movements: stockMovements }];
+  }, [scope, remote, activeLocationId, stockItems, stockMovements]);
+
+  const itemNames = useMemo(
+    () => Array.from(new Set(dataSets.flatMap((d) => d.items.map((i) => i.name)))).sort((a, b) => a.localeCompare(b)),
+    [dataSets]
+  );
+
+  const { summary, detail, low } = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    const summaryRows = [], detailRows = [], lowRows = [];
+
+    dataSets.forEach(({ locationId, items, movements }) => {
+      const itemById = Object.fromEntries(items.map((i) => [i.id, i]));
+
+      items.forEach((i) => {
+        const level = stockLevel(i.id, movements);
+        if (i.active && level <= i.min_threshold) {
+          lowRows.push({ locationId, name: i.name, unit: i.unit, level, min: i.min_threshold, shortfall: Math.max(0, i.min_threshold - level) });
+        }
+      });
+
+      const byItem = {};
+      movements.forEach((m) => {
+        const item = itemById[m.item_id];
+        if (!item) return;
+        if (m.date < from || m.date > to) return;
+        if (itemName && item.name !== itemName) return;
+        if (typeFilter !== "ALL" && m.type !== typeFilter) return;
+        if (q && ![m.person_name, m.company, m.remarks, m.recorded_by, m.id_card_number].some((v) => String(v || "").toLowerCase().includes(q))) return;
+
+        detailRows.push({ ...m, locationId, item });
+        const b = byItem[item.id] || (byItem[item.id] = { locationId, item, inQty: 0, outQty: 0, count: 0 });
+        if (m.type === "IN") b.inQty += Number(m.quantity) || 0; else b.outQty += Number(m.quantity) || 0;
+        b.count += 1;
+      });
+
+      Object.values(byItem).forEach((b) => {
+        const level = stockLevel(b.item.id, movements);
+        summaryRows.push({ ...b, level, isLow: !!b.item.active && level <= b.item.min_threshold });
+      });
+    });
+
+    detailRows.sort((a, b) => (b.date + b.time).localeCompare(a.date + a.time));
+    summaryRows.sort((a, b) => a.locationId.localeCompare(b.locationId) || a.item.name.localeCompare(b.item.name));
+    lowRows.sort((a, b) => a.locationId.localeCompare(b.locationId) || b.shortfall - a.shortfall);
+    return { summary: summaryRows, detail: detailRows, low: lowRows };
+  }, [dataSets, from, to, itemName, typeFilter, search]);
+
+  const multi = scope === "all";
+  const scopeLabel = multi ? `All my locations (${dataSets.length})` : (activeLocationId || "This location");
+  const periodText = `${fmtDate(from)} – ${fmtDate(to)}`;
+  const today = todayStr();
+
+  const summaryHeaders = [
+    { label: "Location", get: (r) => r.locationId }, { label: "Item", get: (r) => r.item.name }, { label: "Unit", get: (r) => r.item.unit },
+    { label: "Total In", get: (r) => r.inQty }, { label: "Total Out (used)", get: (r) => r.outQty }, { label: "Net Change", get: (r) => r.inQty - r.outQty },
+    { label: "Movements", get: (r) => r.count }, { label: "On Hand Now", get: (r) => r.level }, { label: "Minimum", get: (r) => r.item.min_threshold },
+    { label: "Status", get: (r) => (r.isLow ? "LOW STOCK" : "OK") },
+  ];
+  const detailHeaders = [
+    { label: "Location", get: (r) => r.locationId }, { label: "Date", get: (r) => r.date }, { label: "Time", get: (r) => r.time },
+    { label: "Item", get: (r) => r.item.name }, { label: "Type", get: (r) => r.type }, { label: "Quantity", get: (r) => r.quantity },
+    { label: "Unit", get: (r) => r.item.unit }, { label: "Person", get: (r) => r.person_name || "" }, { label: "Phone", get: (r) => r.phone || "" },
+    { label: "Company/Dept", get: (r) => r.company || "" }, { label: "ID/Card Number", get: (r) => r.id_card_number || "" },
+    { label: "Remarks", get: (r) => r.remarks || "" }, { label: "Recorded By", get: (r) => r.recorded_by || "" },
+  ];
+  const lowHeaders = [
+    { label: "Location", get: (r) => r.locationId }, { label: "Item", get: (r) => r.name }, { label: "Unit", get: (r) => r.unit },
+    { label: "On Hand", get: (r) => r.level }, { label: "Minimum", get: (r) => r.min }, { label: "Short By", get: (r) => r.shortfall },
+  ];
+
+  const setPresetAndRange = (p) => {
+    setPreset(p);
+    const r = inventoryPresetRange(p);
+    if (r) { setFrom(r.from); setTo(r.to); }
+  };
+
+  const exportSummary = () => {
+    if (!summary.length) { notify("Nothing to export for these filters", "error"); return; }
+    downloadFile(`inventory-usage-summary-${from}_${to}.csv`, toCSV(summary, summaryHeaders), "text/csv");
+  };
+  const exportDetail = () => {
+    if (!detail.length) { notify("Nothing to export for these filters", "error"); return; }
+    downloadFile(`inventory-usage-detail-${from}_${to}.csv`, toCSV(detail, detailHeaders), "text/csv");
+  };
+  const exportLow = () => {
+    if (!low.length) { notify("No low-stock items to export", "error"); return; }
+    downloadFile(`inventory-low-stock-${today}.csv`, toCSV(low, lowHeaders), "text/csv");
+  };
+
+  const lowLines = () => low.map((r) => `- ${multi ? r.locationId + " · " : ""}${r.name}: ${r.level} ${r.unit} on hand, minimum ${r.min} — short by ${r.shortfall} ${r.unit}`);
+
+  const emailUsage = () => {
+    if (!sendTo.trim()) { notify("Enter the email address to send to", "error"); return; }
+    if (!detail.length) { notify("Nothing to send for these filters", "error"); return; }
+    const filters = [itemName && `Item: ${itemName}`, typeFilter !== "ALL" && `Type: ${typeFilter === "IN" ? "Stock In" : "Stock Out"}`, search.trim() && `Search: ${search.trim()}`].filter(Boolean);
+    const lines = [
+      "Inventory Usage Report", `Location: ${scopeLabel}`, `Period: ${periodText}`,
+      ...(filters.length ? [`Filters: ${filters.join(" · ")}`] : []),
+      `Movements: ${detail.length}`, "", "Usage by item:",
+      ...summary.slice(0, 30).map((r) => `- ${multi ? r.locationId + " · " : ""}${r.item.name}: in ${r.inQty}, out ${r.outQty} ${r.item.unit} (net ${r.inQty - r.outQty >= 0 ? "+" : ""}${r.inQty - r.outQty}), on hand ${r.level}${r.isLow ? " — LOW STOCK" : ""}`),
+      summary.length > 30 ? `…and ${summary.length - 30} more item(s) — see the attached CSV.` : "",
+      "", low.length ? "LOW STOCK — refill needed:" : "No items are currently below their minimum.", ...lowLines(),
+      "", "(A CSV with every movement was just downloaded to your device — attach it before sending.)", "", "Sent from the Aramex Gatehouse Register app.",
+    ].filter((l) => l !== null && l !== undefined && l !== false);
+    downloadFile(`inventory-usage-detail-${from}_${to}.csv`, toCSV(detail, detailHeaders), "text/csv");
+    openMailDraft(sendTo.trim(), `Inventory Usage Report — ${periodText}${low.length ? ` (${low.length} LOW STOCK)` : ""}`, lines.join("\n"));
+    notify("Report ready — check your email app");
+  };
+
+  const emailLow = () => {
+    if (!sendTo.trim()) { notify("Enter the email address to send to", "error"); return; }
+    if (!low.length) { notify("No low-stock items to report", "error"); return; }
+    const lines = [
+      "LOW STOCK — REFILL NEEDED", `Location: ${scopeLabel}`, `Date: ${fmtDate(today)}`, "",
+      `${low.length} item(s) are at or below their minimum quantity and need to be refilled:`, "", ...lowLines(),
+      "", "Please arrange a refill as soon as possible.", "", "(A CSV of this list was just downloaded to your device — attach it before sending.)", "", "Sent from the Aramex Gatehouse Register app.",
+    ];
+    downloadFile(`inventory-low-stock-${today}.csv`, toCSV(low, lowHeaders), "text/csv");
+    openMailDraft(sendTo.trim(), `LOW STOCK — ${low.length} item(s) need refilling (${fmtDate(today)})`, lines.join("\n"));
+    notify("Low-stock report ready — check your email app");
+  };
+
+  const pill = (k, label) => (
+    <button key={k} onClick={() => setView(k)} style={{
+      padding: "6px 11px", borderRadius: 16, fontSize: 12, fontWeight: 600, cursor: "pointer",
+      border: `1px solid ${view === k ? C.navy : C.line}`, background: view === k ? C.navy : "#fff", color: view === k ? "#fff" : C.ink,
+    }}>{label}</button>
+  );
+
+  return (
+    <div>
+      <div style={{ display: "flex", gap: 6, marginBottom: 12, alignItems: "center", flexWrap: "wrap" }}>
+        {pill("usage", "Usage report")}
+        {pill("low", `Low-stock report${low.length ? ` (${low.length})` : ""}`)}
+        {multi && <Btn size="sm" tone="paper" onClick={() => setRefreshKey((k) => k + 1)} disabled={loading}>{loading ? "Loading…" : "Refresh"}</Btn>}
+      </div>
+
+      <div style={{ background: "#fff", border: `1px solid ${C.line}`, borderRadius: 10, padding: 12, marginBottom: 12 }}>
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+          <Field label="Location">
+            <select style={inputStyle} value={scope} onChange={(e) => { setScope(e.target.value); setItemName(""); }}>
+              <option value="current">{activeLocationId || "This location"} (current)</option>
+              {canAll && <option value="all">All my locations</option>}
+            </select>
+          </Field>
+          {view === "usage" && (
+            <Field label="Period">
+              <select style={inputStyle} value={preset} onChange={(e) => setPresetAndRange(e.target.value)}>
+                <option value="today">Today</option><option value="week">This week</option><option value="month">This month</option>
+                <option value="lastmonth">Last month</option><option value="30days">Last 30 days</option><option value="custom">Custom dates</option>
+              </select>
+            </Field>
+          )}
+          {view === "usage" && (
+            <Field label="From"><input type="date" style={inputStyle} value={from} onChange={(e) => { setFrom(e.target.value); setPreset("custom"); }} /></Field>
+          )}
+          {view === "usage" && (
+            <Field label="To"><input type="date" style={inputStyle} value={to} onChange={(e) => { setTo(e.target.value); setPreset("custom"); }} /></Field>
+          )}
+          {view === "usage" && (
+            <Field label="Item">
+              <select style={inputStyle} value={itemName} onChange={(e) => setItemName(e.target.value)}>
+                <option value="">All items</option>
+                {itemNames.map((n) => <option key={n} value={n}>{n}</option>)}
+              </select>
+            </Field>
+          )}
+          {view === "usage" && (
+            <Field label="Type">
+              <select style={inputStyle} value={typeFilter} onChange={(e) => setTypeFilter(e.target.value)}>
+                <option value="ALL">Stock In and Out</option><option value="OUT">Stock Out (used)</option><option value="IN">Stock In (received)</option>
+              </select>
+            </Field>
+          )}
+        </div>
+        {view === "usage" && (
+          <div style={{ marginTop: 10 }}>
+            <Field label="Person, company or remarks contains">
+              <input style={inputStyle} value={search} onChange={(e) => setSearch(e.target.value)} placeholder="e.g. a name, company or note" />
+            </Field>
+          </div>
+        )}
+      </div>
+
+      {loadError && <div style={{ background: "#FDE8E8", border: "1px solid #F5B5B5", borderRadius: 8, padding: "9px 12px", fontSize: 12.5, color: C.redDeep, marginBottom: 12 }}>{loadError}</div>}
+      {failedLocations.length > 0 && (
+        <div style={{ background: "#FFF6E0", border: "1px solid #EBD28A", borderRadius: 8, padding: "9px 12px", fontSize: 12.5, color: C.ink, marginBottom: 12 }}>
+          Could not load: {failedLocations.map((f) => `${f.locationId} (${f.error})`).join("; ")}
+        </div>
+      )}
+      {scope === "all" && loading && !remote && <div style={{ fontSize: 13, color: C.ink50, padding: "8px 2px" }}>Loading stock from all your locations…</div>}
+
+      {view === "usage" ? (
+        <div>
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 10, fontSize: 12.5, color: C.ink50 }}>
+            <span><b style={{ color: C.ink }}>{detail.length}</b> movement(s)</span>·
+            <span><b style={{ color: C.ink }}>{summary.length}</b> item row(s)</span>·
+            <span>{scopeLabel}</span>·<span>{periodText}</span>
+          </div>
+
+          <div style={{ background: "#fff", border: `1px solid ${C.line}`, borderRadius: 10, overflow: "hidden", marginBottom: 12 }}>
+            <div style={{ padding: "10px 12px", fontWeight: 700, fontSize: 13.5, color: C.ink }}>Usage by item</div>
+            {summary.length === 0 ? <EmptyState icon={ClipboardList} title="No stock movements match these filters" /> : (
+              <TableScroll headers={[...(multi ? ["Location"] : []), "Item", "In", "Out (used)", "Net", "On hand", "Status"]}>
+                {summary.map((r) => (
+                  <tr key={r.locationId + r.item.id}>
+                    {multi && <Td>{r.locationId}</Td>}
+                    <Td>{r.item.name}</Td>
+                    <Td>{r.inQty} {r.item.unit}</Td>
+                    <Td>{r.outQty} {r.item.unit}</Td>
+                    <Td>{r.inQty - r.outQty >= 0 ? "+" : ""}{r.inQty - r.outQty}</Td>
+                    <Td>{r.level} {r.item.unit}</Td>
+                    <Td>{r.isLow ? <Badge tone="missing">LOW STOCK</Badge> : <Badge tone="inside">OK</Badge>}</Td>
+                  </tr>
+                ))}
+              </TableScroll>
+            )}
+          </div>
+
+          <div style={{ background: "#fff", border: `1px solid ${C.line}`, borderRadius: 10, overflow: "hidden", marginBottom: 12 }}>
+            <div style={{ padding: "10px 12px", fontWeight: 700, fontSize: 13.5, color: C.ink }}>Movements{detail.length > 150 ? " (latest 150 shown — the CSV has all)" : ""}</div>
+            {detail.length === 0 ? <EmptyState icon={ClipboardList} title="No movements" /> : (
+              <TableScroll headers={[...(multi ? ["Location"] : []), "Date", "Item", "Type", "Qty", "Person", "Company", "Recorded by"]}>
+                {detail.slice(0, 150).map((m) => (
+                  <tr key={m.locationId + m.id}>
+                    {multi && <Td>{m.locationId}</Td>}
+                    <Td>{m.date} {fmtTime(m.time)}</Td>
+                    <Td>{m.item.name}</Td>
+                    <Td><Badge tone={m.type === "IN" ? "inside" : "out"}>{m.type}</Badge></Td>
+                    <Td>{m.quantity} {m.item.unit}</Td>
+                    <Td>{m.person_name || "—"}</Td>
+                    <Td>{m.company || "—"}</Td>
+                    <Td>{m.recorded_by || "—"}</Td>
+                  </tr>
+                ))}
+              </TableScroll>
+            )}
+          </div>
+
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 10 }}>
+            <Btn size="sm" tone="paper" icon={FileDown} onClick={exportSummary}>Summary CSV</Btn>
+            <Btn size="sm" tone="paper" icon={FileDown} onClick={exportDetail}>Detail CSV</Btn>
+          </div>
+          <div style={{ background: "#fff", border: `1px solid ${C.line}`, borderRadius: 10, padding: 12 }}>
+            <Field label="Send this report to (email)">
+              <input type="email" style={inputStyle} value={sendTo} onChange={(e) => setSendTo(e.target.value)} placeholder="name@company.com" />
+            </Field>
+            <div style={{ marginTop: 10 }}><Btn size="sm" tone="navy" icon={Download} onClick={emailUsage}>Email this report</Btn></div>
+            <div style={{ fontSize: 11.5, color: C.ink50, marginTop: 8, lineHeight: 1.5 }}>Opens your email app with the report filled in and downloads the CSV — attach it, then send.</div>
+          </div>
+        </div>
+      ) : (
+        <div>
+          <div style={{ background: low.length ? "#F7E7E5" : "#EAF5EE", border: `1px solid ${low.length ? "#E9C3BE" : "#BFE0CB"}`, borderRadius: 10, padding: "12px 14px", marginBottom: 12, fontSize: 13.5, fontWeight: 700, color: low.length ? C.redDeep : C.ink }}>
+            {low.length ? `${low.length} item(s) need refilling — ${scopeLabel}` : `All items are above their minimum — ${scopeLabel}`}
+          </div>
+          {low.length > 0 && (
+            <div style={{ background: "#fff", border: `1px solid ${C.line}`, borderRadius: 10, overflow: "hidden", marginBottom: 12 }}>
+              <TableScroll headers={[...(multi ? ["Location"] : []), "Item", "On hand", "Minimum", "Short by"]}>
+                {low.map((r) => (
+                  <tr key={r.locationId + r.name}>
+                    {multi && <Td>{r.locationId}</Td>}
+                    <Td>{r.name}</Td>
+                    <Td>{r.level} {r.unit}</Td>
+                    <Td>{r.min} {r.unit}</Td>
+                    <Td><b style={{ color: C.redDeep }}>{r.shortfall} {r.unit}</b></Td>
+                  </tr>
+                ))}
+              </TableScroll>
+            </div>
+          )}
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 10 }}>
+            <Btn size="sm" tone="paper" icon={FileDown} onClick={exportLow}>Low-stock CSV</Btn>
+          </div>
+          <div style={{ background: "#fff", border: `1px solid ${C.line}`, borderRadius: 10, padding: 12 }}>
+            <Field label="Send the low-stock report to (email)">
+              <input type="email" style={inputStyle} value={sendTo} onChange={(e) => setSendTo(e.target.value)} placeholder="name@company.com" />
+            </Field>
+            <div style={{ marginTop: 10 }}><Btn size="sm" tone="red" icon={AlertTriangle} onClick={emailLow} disabled={low.length === 0}>Email low-stock report</Btn></div>
+            <div style={{ fontSize: 11.5, color: C.ink50, marginTop: 8, lineHeight: 1.5 }}>Opens your email app with the refill list filled in and downloads the CSV — attach it, then send.</div>
+          </div>
+        </div>
       )}
     </div>
   );
