@@ -462,6 +462,43 @@ async function syncArrayToCollection(db, collectionPath, prevArray, nextArray) {
 }
 
 /* ---------------------------------------------------------------------
+   LOCATION-SCOPED DATA (Firebase mode)
+   Every location's records live under locations/{locationId}/...
+   Settings live in locations/{locationId}/config/app.
+--------------------------------------------------------------------- */
+const LOCATION_COLLECTIONS = [
+  "employees", "attendance", "auditLogs", "leaves", "visitors", "stockItems",
+  "stockMovements", "handoverItems", "handoverRecords", "incidents", "shipments",
+];
+const ACTIVE_LOCATION_KEY = "gate_register__active_location";
+
+function locationCollectionPath(locationId, name) {
+  return `locations/${locationId}/${name}`;
+}
+function locationSettingsPath(locationId) {
+  return `locations/${locationId}/config/app`;
+}
+
+// Firestore returns documents in id order; the app expects newest first
+// (it always prepends new records), so restore that order.
+function sortNewestFirst(records) {
+  const stamp = (r) => Number(r.created_at ?? r.timestamp ?? r.updated_at ?? 0) || 0;
+  return records.slice().sort((a, b) => (stamp(b) - stamp(a)) || String(a.id).localeCompare(String(b.id)));
+}
+
+function describeFirestoreError(e, what) {
+  const code = e && e.code ? String(e.code) : "";
+  const msg = e && e.message ? String(e.message) : "";
+  if (code === "permission-denied") {
+    return `Not allowed to ${what}. Your account may not have access to this location, or the Firestore rules do not allow it.`;
+  }
+  if (code === "unavailable" || /offline/i.test(msg)) {
+    return `Could not ${what}: cannot reach Firestore. Check the internet connection.`;
+  }
+  return `Could not ${what}: ${msg || code || "unknown error"}`;
+}
+
+/* ---------------------------------------------------------------------
    FIREBASE SYNC (optional — for a copy of this app hosted outside Claude,
    e.g. on GitHub Pages, where Claude's own db capability isn't present).
    The Firestore compat SDK's collection/doc/onSnapshot shape is close
@@ -1042,6 +1079,9 @@ function App() {
   const [syncMode, setSyncMode] = useState("checking"); // "checking" | "synced" | "firebase" | "local"
   const [canWriteShared, setCanWriteShared] = useState(null); // null = unknown/not applicable (Claude-sync only)
   const [firebaseError, setFirebaseError] = useState("");
+  const [activeLocationId, setActiveLocationId] = useState(null); // Firebase mode only
+  const [dataError, setDataError] = useState("");
+  const activeLocationIdRef = useRef(null); activeLocationIdRef.current = activeLocationId;
   const dbApiRef = useRef(null);
   const authApiRef = useRef(null);
   const dbModeRef = useRef("local");
@@ -1248,86 +1288,180 @@ function App() {
   }, []);
  
     
+  // Saves one array. Local mode: device storage. Claude shared db: root
+  // collections, as before. Firebase mode: locations/{activeLocation}/...
+  // On a failed save the screen is restored, an error is shown, and the
+  // error is re-thrown so callers do not report success.
+  const saveRecords = async (name, storageKey, setter, ref, next) => {
+    const prev = ref.current;
+    setter(next);
+    const db = dbApiRef.current;
+
+    if (!db) {
+      await saveKey(storageKey, next);
+      return;
+    }
+
+    let path = name;
+
+    if (dbModeRef.current === "firebase") {
+      const locationId = activeLocationIdRef.current;
+
+      if (!locationId) {
+        setter(prev);
+        const msg = "Choose a location before saving.";
+        notify(msg, "error");
+        throw new Error(msg);
+      }
+
+      path = locationCollectionPath(locationId, name);
+    }
+
+    try {
+      await syncArrayToCollection(db, path, prev, next);
+    } catch (e) {
+      console.error("Save failed:", path, e);
+      setter(prev);
+      notify(describeFirestoreError(e, `save ${name}`), "error");
+      throw e;
+    }
+  };
+
   const persist = {
-    employees: async (next) => {
-      setEmployees(next);
-      const db = dbApiRef.current;
-      if (db) await syncArrayToCollection(db, "employees", employeesRef.current, next);
-      else await saveKey(KEYS.employees, next);
-    },
+    employees: (next) => saveRecords("employees", KEYS.employees, setEmployees, employeesRef, next),
+    attendance: (next) => saveRecords("attendance", KEYS.attendance, setAttendance, attendanceRef, next),
+    audit: (next) => saveRecords("auditLogs", KEYS.audit, setAudit, auditRef, next),
+    leaves: (next) => saveRecords("leaves", KEYS.leaves, setLeaves, leavesRef, next),
+    visitors: (next) => saveRecords("visitors", KEYS.visitors, setVisitors, visitorsRef, next),
+    stockItems: (next) => saveRecords("stockItems", KEYS.stockItems, setStockItems, stockItemsRef, next),
+    stockMovements: (next) => saveRecords("stockMovements", KEYS.stockMovements, setStockMovements, stockMovementsRef, next),
+    handoverItems: (next) => saveRecords("handoverItems", KEYS.handoverItems, setHandoverItems, handoverItemsRef, next),
+    handoverRecords: (next) => saveRecords("handoverRecords", KEYS.handoverRecords, setHandoverRecords, handoverRecordsRef, next),
+    incidents: (next) => saveRecords("incidents", KEYS.incidents, setIncidents, incidentsRef, next),
+    shipments: (next) => saveRecords("shipments", KEYS.shipments, setShipments, shipmentsRef, next),
     users: async (next) => {
-      setUsers(next);
-      const db = dbApiRef.current;
-      if (db) await syncArrayToCollection(db, "users", usersRef.current, next);
-      else await saveKey(KEYS.users, next);
-    },
-    attendance: async (next) => {
-      setAttendance(next);
-      const db = dbApiRef.current;
-      if (db) await syncArrayToCollection(db, "attendance", attendanceRef.current, next);
-      else await saveKey(KEYS.attendance, next);
-    },
-    audit: async (next) => {
-      setAudit(next);
-      const db = dbApiRef.current;
-      if (db) await syncArrayToCollection(db, "auditLogs", auditRef.current, next);
-      else await saveKey(KEYS.audit, next);
-    },
-    leaves: async (next) => {
-      setLeaves(next);
-      const db = dbApiRef.current;
-      if (db) await syncArrayToCollection(db, "leaves", leavesRef.current, next);
-      else await saveKey(KEYS.leaves, next);
-    },
-    visitors: async (next) => {
-      setVisitors(next);
-      const db = dbApiRef.current;
-      if (db) await syncArrayToCollection(db, "visitors", visitorsRef.current, next);
-      else await saveKey(KEYS.visitors, next);
-    },
-    stockItems: async (next) => {
-      setStockItems(next);
-      const db = dbApiRef.current;
-      if (db) await syncArrayToCollection(db, "stockItems", stockItemsRef.current, next);
-      else await saveKey(KEYS.stockItems, next);
-    },
-    stockMovements: async (next) => {
-      setStockMovements(next);
-      const db = dbApiRef.current;
-      if (db) await syncArrayToCollection(db, "stockMovements", stockMovementsRef.current, next);
-      else await saveKey(KEYS.stockMovements, next);
-    },
-    handoverItems: async (next) => {
-      setHandoverItems(next);
-      const db = dbApiRef.current;
-      if (db) await syncArrayToCollection(db, "handoverItems", handoverItemsRef.current, next);
-      else await saveKey(KEYS.handoverItems, next);
-    },
-    handoverRecords: async (next) => {
-      setHandoverRecords(next);
-      const db = dbApiRef.current;
-      if (db) await syncArrayToCollection(db, "handoverRecords", handoverRecordsRef.current, next);
-      else await saveKey(KEYS.handoverRecords, next);
-    },
-    incidents: async (next) => {
-      setIncidents(next);
-      const db = dbApiRef.current;
-      if (db) await syncArrayToCollection(db, "incidents", incidentsRef.current, next);
-      else await saveKey(KEYS.incidents, next);
-    },
-    shipments: async (next) => {
-      setShipments(next);
-      const db = dbApiRef.current;
-      if (db) await syncArrayToCollection(db, "shipments", shipmentsRef.current, next);
-      else await saveKey(KEYS.shipments, next);
+      // In Firebase mode accounts live in Firebase Authentication and the
+      // staff collection, not in this app, so there is nothing to save here.
+      if (dbModeRef.current === "firebase") return;
+      await saveRecords("users", KEYS.users, setUsers, usersRef, next);
     },
     settings: async (next) => {
+      const prevSettings = settings;
       setSettings(next);
       const db = dbApiRef.current;
-      if (db) await db.doc("config/app").set(next);
-      else await saveKey(KEYS.settings, next);
+
+      if (!db) {
+        await saveKey(KEYS.settings, next);
+        return;
+      }
+
+      let docPath = "config/app";
+
+      if (dbModeRef.current === "firebase") {
+        const locationId = activeLocationIdRef.current;
+
+        if (!locationId) {
+          setSettings(prevSettings);
+          const msg = "Choose a location before saving.";
+          notify(msg, "error");
+          throw new Error(msg);
+        }
+
+        docPath = locationSettingsPath(locationId);
+      }
+
+      try {
+        await db.doc(docPath).set(cleanForStore(next));
+      } catch (e) {
+        console.error("Save failed:", docPath, e);
+        setSettings(prevSettings);
+        notify(describeFirestoreError(e, "save settings"), "error");
+        throw e;
+      }
     },
   };
+
+  // FIREBASE MODE: pick the active location once signed in.
+  useEffect(() => {
+    if (!session || dbModeRef.current !== "firebase") {
+      setActiveLocationId(null);
+      return;
+    }
+
+    const ids = Array.isArray(session.locationIds) ? session.locationIds : [];
+    let saved = null;
+    try { saved = localStorage.getItem(ACTIVE_LOCATION_KEY); } catch (e) { saved = null; }
+    setActiveLocationId(saved && ids.includes(saved) ? saved : (ids[0] || null));
+  }, [session]);
+
+  const changeLocation = (locationId) => {
+    setActiveLocationId(locationId);
+    try { localStorage.setItem(ACTIVE_LOCATION_KEY, locationId); } catch (e) { /* ignore */ }
+  };
+
+  // FIREBASE MODE: live subscriptions for the active location only.
+  // Re-runs (and cleanly unsubscribes) when the location changes or the
+  // user signs out.
+  useEffect(() => {
+    const db = dbApiRef.current;
+
+    if (dbModeRef.current !== "firebase" || !db || !session || !activeLocationId) {
+      return undefined;
+    }
+
+    let cancelled = false;
+    const locationId = activeLocationId;
+
+    setDataError("");
+    setEmployees([]); setAttendance([]); setAudit([]); setLeaves([]); setVisitors([]);
+    setStockItems([]); setStockMovements([]); setHandoverItems([]); setHandoverRecords([]);
+    setIncidents([]); setShipments([]); setSettings(defaultSettings());
+
+    const setters = {
+      employees: setEmployees, attendance: setAttendance, auditLogs: setAudit, leaves: setLeaves,
+      visitors: setVisitors, stockItems: setStockItems, stockMovements: setStockMovements,
+      handoverItems: setHandoverItems, handoverRecords: setHandoverRecords,
+      incidents: setIncidents, shipments: setShipments,
+    };
+
+    const onReadError = (label, err) => {
+      if (cancelled) return;
+      console.error("Firestore read failed:", locationId, label, err);
+      setDataError(describeFirestoreError(err, `read ${label} for ${locationId}`));
+    };
+
+    const unsubscribers = [];
+
+    LOCATION_COLLECTIONS.forEach((name) => {
+      unsubscribers.push(
+        getLocationCollection(db, locationId, name).onSnapshot(
+          (snap) => {
+            if (cancelled) return;
+            setters[name](sortNewestFirst(snap.docs.map((d) => ({ ...d.data(), id: d.id }))));
+          },
+          (err) => onReadError(name, err)
+        )
+      );
+    });
+
+    unsubscribers.push(
+      db.doc(locationSettingsPath(locationId)).onSnapshot(
+        (snap) => {
+          if (cancelled) return;
+          setSettings(migrateSettings(snap.exists ? snap.data() : null));
+        },
+        (err) => onReadError("settings", err)
+      )
+    );
+
+    return () => {
+      cancelled = true;
+      unsubscribers.forEach((unsubscribe) => {
+        try { unsubscribe(); } catch (e) { /* ignore */ }
+      });
+    };
+  }, [session, activeLocationId]);
+
   // LOCATION ACCESS HELPERS
 function getUserLocationIds(session) {
   if (!session || !Array.isArray(session.locationIds)) {
@@ -1413,7 +1547,14 @@ function getLocationCollection(db, locationId, collectionName) {
   }}
   syncMode={syncMode}
   canWriteShared={canWriteShared}
+  activeLocationId={activeLocationId}
+  onLocationChange={changeLocation}
 />
+      {dataError && (
+        <div style={{ background: "#FDE8E8", borderBottom: "1px solid #F5B5B5", padding: "9px 14px", textAlign: "center", fontSize: 12.5, color: C.redDeep }}>
+          {dataError}
+        </div>
+      )}
       {syncMode === "synced" && canWriteShared === false && (
         <div style={{ background: "#FEF3C7", borderBottom: `1px solid #FDE68A`, padding: "9px 14px", textAlign: "center", fontSize: 12.5, color: C.amberDeep }}>
           You can see live data here, but can't save changes yet — ask whoever owns this page to give you edit access (see Settings for details).
@@ -1485,27 +1626,37 @@ function getLocationCollection(db, locationId, collectionName) {
             persistUsers={persist.users} notify={notify} sendReport={sendReport} syncMode={syncMode} canWriteShared={canWriteShared} firebaseError={firebaseError}
             loadSample={async () => {
               setBusy(true);
-              const sample = await buildSampleData();
-              await persist.employees(sample.employees); await persist.users(sample.users);
-              await persist.attendance(sample.attendance); await persist.audit(sample.audit);
-              await persist.leaves(sample.leaves); await persist.visitors(sample.visitors);
-              await persist.stockItems(sample.stockItems); await persist.stockMovements(sample.stockMovements);
-              await persist.handoverItems(sample.handoverItems); await persist.handoverRecords(sample.handoverRecords);
-              await persist.incidents(sample.incidents); await persist.shipments(sample.shipments); await persist.settings(sample.settings);
-              setBusy(false);
-              notify("Sample data loaded");
+              try {
+                const sample = await buildSampleData();
+                await persist.employees(sample.employees); await persist.users(sample.users);
+                await persist.attendance(sample.attendance); await persist.audit(sample.audit);
+                await persist.leaves(sample.leaves); await persist.visitors(sample.visitors);
+                await persist.stockItems(sample.stockItems); await persist.stockMovements(sample.stockMovements);
+                await persist.handoverItems(sample.handoverItems); await persist.handoverRecords(sample.handoverRecords);
+                await persist.incidents(sample.incidents); await persist.shipments(sample.shipments); await persist.settings(sample.settings);
+                notify("Sample data loaded");
+              } catch (e) {
+                console.error("Load sample failed:", e); // the failed save already showed an error
+              } finally {
+                setBusy(false);
+              }
             }}
             eraseAll={async () => {
               setBusy(true);
-              const fresh = await buildFreshData();
-              await persist.employees(fresh.employees); await persist.users(fresh.users);
-              await persist.attendance(fresh.attendance); await persist.audit(fresh.audit);
-              await persist.leaves(fresh.leaves); await persist.visitors(fresh.visitors);
-              await persist.stockItems(fresh.stockItems); await persist.stockMovements(fresh.stockMovements);
-              await persist.handoverItems(fresh.handoverItems); await persist.handoverRecords(fresh.handoverRecords);
-              await persist.incidents(fresh.incidents); await persist.shipments(fresh.shipments); await persist.settings(fresh.settings);
-              setBusy(false);
-              notify("All data erased — starting fresh");
+              try {
+                const fresh = await buildFreshData();
+                await persist.employees(fresh.employees); await persist.users(fresh.users);
+                await persist.attendance(fresh.attendance); await persist.audit(fresh.audit);
+                await persist.leaves(fresh.leaves); await persist.visitors(fresh.visitors);
+                await persist.stockItems(fresh.stockItems); await persist.stockMovements(fresh.stockMovements);
+                await persist.handoverItems(fresh.handoverItems); await persist.handoverRecords(fresh.handoverRecords);
+                await persist.incidents(fresh.incidents); await persist.shipments(fresh.shipments); await persist.settings(fresh.settings);
+                notify("All data erased — starting fresh");
+              } catch (e) {
+                console.error("Erase failed:", e); // the failed save already showed an error
+              } finally {
+                setBusy(false);
+              }
             }}
             busy={busy}
           />
@@ -1521,7 +1672,7 @@ function getLocationCollection(db, locationId, collectionName) {
    Aramex-branded top bar (red wordmark + "Gatehouse Register" subtitle)
    with a bottom tab bar, icon + name on every tab.
 --------------------------------------------------------------------- */
-function Header({ session, onLogout, syncMode, canWriteShared }) {
+function Header({ session, onLogout, syncMode, canWriteShared, activeLocationId, onLocationChange }) {
   const dotColor = syncMode === "firebase" ? "#10B981" : syncMode === "synced" ? (canWriteShared === false ? C.amberDeep : "#10B981") : C.ink50;
   const syncLabel = syncMode === "firebase" ? "Synced via Firebase" : syncMode === "synced" ? (canWriteShared === false ? "Synced · read-only" : "Synced across devices") : "Local device only";
 
@@ -1540,6 +1691,24 @@ function Header({ session, onLogout, syncMode, canWriteShared }) {
             <span style={{ width: 5, height: 5, borderRadius: "50%", background: dotColor, display: "inline-block" }} />
             {syncLabel.toUpperCase()}
           </div>
+          {syncMode === "firebase" && activeLocationId && (
+            <div style={{ marginTop: 6 }}>
+              {Array.isArray(session.locationIds) && session.locationIds.length > 1 ? (
+                <select
+                  value={activeLocationId}
+                  onChange={(e) => onLocationChange(e.target.value)}
+                  aria-label="Location"
+                  style={{ fontFamily: FONT_MONO, fontSize: 11, padding: "3px 6px", borderRadius: 6, border: "1px solid rgba(255,255,255,0.4)", background: "rgba(255,255,255,0.16)", color: "#fff" }}
+                >
+                  {session.locationIds.map((id) => (
+                    <option key={id} value={id} style={{ color: "#111" }}>{id}</option>
+                  ))}
+                </select>
+              ) : (
+                <span style={{ fontFamily: FONT_MONO, fontSize: 10.5, color: "rgba(255,255,255,0.9)" }}>{activeLocationId}</span>
+              )}
+            </div>
+          )}
         </div>
         <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
           <div style={{ width: 38, height: 38, borderRadius: "50%", background: "rgba(255,255,255,0.18)", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
@@ -5311,6 +5480,15 @@ function SettingsScreen({ settings, persistSettings, users, persistUsers, notify
         })}
       </div>
 
+      {syncMode === "firebase" ? (
+        <div style={{ background: "#fff", border: `1px solid ${C.line}`, borderRadius: 10, padding: 16, marginBottom: 16 }}>
+          <h3 style={{ fontFamily: FONT_SERIF, fontSize: 16, margin: "0 0 8px" }}>Guard &amp; Admin Accounts</h3>
+          <p style={{ fontSize: 13, color: C.ink50, margin: 0, lineHeight: 1.6 }}>
+            In Firebase mode, accounts are managed in Firebase: create the person under <b>Authentication → Users</b>, then add a
+            matching document in the <b>staff</b> collection (ID = their Auth UID) with name, role, active and locationIds.
+          </p>
+        </div>
+      ) : (
       <div style={{ background: "#fff", border: `1px solid ${C.line}`, borderRadius: 10, padding: 16, marginBottom: 16 }}>
         <h3 style={{ fontFamily: FONT_SERIF, fontSize: 16, margin: "0 0 12px" }}>Guard &amp; Admin Accounts</h3>
         <div style={{ display: "flex", flexDirection: "column", gap: 6, marginBottom: 14 }}>
@@ -5344,6 +5522,7 @@ function SettingsScreen({ settings, persistSettings, users, persistUsers, notify
         </div>
         <Btn tone="navy" icon={UserPlus} onClick={addUser}>Create Account</Btn>
       </div>
+      )}
 
       <div style={{ background: "#fff", border: `1px solid ${C.line}`, borderRadius: 10, padding: 16 }}>
         <h3 style={{ fontFamily: FONT_SERIF, fontSize: 16, margin: "0 0 8px" }}>Data Management</h3>
