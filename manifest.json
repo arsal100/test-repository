@@ -1,0 +1,27 @@
+{
+  "id": "/aramex-gatehouse-system/",
+  "name": "Aramex Gatehouse System",
+  "short_name": "Aramex Gatehouse",
+  "description": "Digital gatehouse and security operations register for Aramex locations.",
+  "start_url": "/aramex-gatehouse-system/",
+  "scope": "/aramex-gatehouse-system/",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#FFFFFF",
+  "theme_color": "#C8102E",
+  "lang": "en",
+  "icons": [
+    {
+      "src": "/aramex-gatehouse-system/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/aramex-gatehouse-system/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    }
+  ]
+}
