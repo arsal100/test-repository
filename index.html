@@ -593,6 +593,9 @@ function resolveLoginEmail(identifier, authDomain) {
   return usernameToAuthEmail(raw, authDomain);
 }
 
+// Extra email domains a guard username may have been registered under in Firebase Authentication.
+const LEGACY_USERNAME_DOMAINS = ["security.aramex.invalid"];
+
 async function signInWithGatehouseUsername(auth, identifier, password, authDomain) {
   if (!auth) {
     throw new Error("Firebase Authentication is not initialized.");
@@ -602,9 +605,27 @@ async function signInWithGatehouseUsername(auth, identifier, password, authDomai
     throw new Error("Please enter your password.");
   }
 
+  const raw = String(identifier || "").trim();
   const email = resolveLoginEmail(identifier, authDomain);
 
-  return await auth.signInWithEmailAndPassword(email, password);
+  try {
+    return await auth.signInWithEmailAndPassword(email, password);
+  } catch (firstError) {
+    const code = firstError && firstError.code;
+    const credentialProblem = code === "auth/invalid-credential" || code === "auth/user-not-found" || code === "auth/wrong-password";
+
+    // A guard username may also have been created with a legacy email domain.
+    // Only usernames (no "@") get this second try; the first error is reported.
+    if (raw.includes("@") || !credentialProblem) throw firstError;
+
+    for (const domain of LEGACY_USERNAME_DOMAINS) {
+      try {
+        return await auth.signInWithEmailAndPassword(`${raw.toLowerCase()}@${domain}`, password);
+      } catch (e) { /* try the next domain, then report the first error */ }
+    }
+
+    throw firstError;
+  }
 }
 
 // Turns a Firebase Authentication error into a clear, user-facing message.
@@ -2325,7 +2346,10 @@ function CheckInScreen({ session, employees, attendance, settings, leaves, persi
   const [remarks, setRemarks] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [success, setSuccess] = useState(null);
-  const [backdate, setBackdate] = useState(false);
+  // Only admins may record a past date/time. Everyone else is always stamped with the current time.
+  const canBackdate = session.role === "admin";
+  const [backdate, setBackdateRaw] = useState(false);
+  const setBackdate = (v) => setBackdateRaw(canBackdate ? v : false);
   const [bdDate, setBdDate] = useState(todayStr());
   const [bdTime, setBdTime] = useState(nowTimeStr().slice(0, 5));
   const [bdError, setBdError] = useState("");
@@ -2435,8 +2459,12 @@ function CheckInScreen({ session, employees, attendance, settings, leaves, persi
             )}
           </div>
 
-          <BackdateDateTime label="Arrived earlier or on a previous date? Set the real check-in date & time" active={backdate} setActive={setBackdate}
-            date={bdDate} setDate={setBdDate} time={bdTime} setTime={setBdTime} error={bdError} setError={setBdError} />
+          {canBackdate ? (
+            <BackdateDateTime label="Arrived earlier or on a previous date? Set the real check-in date & time" active={backdate} setActive={setBackdate}
+              date={bdDate} setDate={setBdDate} time={bdTime} setTime={setBdTime} error={bdError} setError={setBdError} />
+          ) : (
+            <div style={{ fontSize: 12, color: C.ink50, marginBottom: 14 }}>Check-in is recorded at the current time automatically.</div>
+          )}
           {backdate && (
             <div style={{ marginBottom: 14 }}>
               <label style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer", marginBottom: alsoOut ? 8 : 0 }}>
@@ -2539,7 +2567,10 @@ function CheckOutScreen({ session, employees, attendance, settings, persistAtten
   const [remarks, setRemarks] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [success, setSuccess] = useState(null);
-  const [backdate, setBackdate] = useState(false);
+  // Only admins may record a past date/time. Everyone else is always stamped with the current time.
+  const canBackdate = session.role === "admin";
+  const [backdate, setBackdateRaw] = useState(false);
+  const setBackdate = (v) => setBackdateRaw(canBackdate ? v : false);
   const [bdDate, setBdDate] = useState(todayStr());
   const [bdTime, setBdTime] = useState(nowTimeStr().slice(0, 5));
   const [bdError, setBdError] = useState("");
@@ -2629,12 +2660,16 @@ function CheckOutScreen({ session, employees, attendance, settings, persistAtten
 
           {activeRecord.date < todayStr() && !backdate && (
             <div style={{ background: "#FEF3C7", border: `1px solid #FDE68A`, borderRadius: 8, padding: "9px 11px", fontSize: 12.5, color: C.amberDeep, marginBottom: 12, lineHeight: 1.5 }}>
-              This check-in is from <b>{fmtDate(activeRecord.date)}</b> — they were probably never checked out. If they actually left earlier, set the real check-out date &amp; time below.
+              This check-in is from <b>{fmtDate(activeRecord.date)}</b> — they were probably never checked out. {canBackdate ? "If they actually left earlier, set the real check-out date & time below." : "Only an admin can set a past check-out time — ask the admin to correct this record after checking out."}
             </div>
           )}
-          <BackdateDateTime label="Already left? Set the real check-out date & time (can be a previous date)" active={backdate}
-            setActive={(v) => { setBackdate(v); if (v) { setBdDate(activeRecord.date < todayStr() ? activeRecord.date : todayStr()); setBdError(""); } }}
-            date={bdDate} setDate={setBdDate} time={bdTime} setTime={setBdTime} error={bdError} setError={setBdError} />
+          {canBackdate ? (
+            <BackdateDateTime label="Already left? Set the real check-out date & time (can be a previous date)" active={backdate}
+              setActive={(v) => { setBackdate(v); if (v) { setBdDate(activeRecord.date < todayStr() ? activeRecord.date : todayStr()); setBdError(""); } }}
+              date={bdDate} setDate={setBdDate} time={bdTime} setTime={setBdTime} error={bdError} setError={setBdError} />
+          ) : (
+            <div style={{ fontSize: 12, color: C.ink50, marginBottom: 14 }}>Check-out is recorded at the current time automatically.</div>
+          )}
 
           <Field label="Remarks (optional)">
             <RemarksPicker value={remarks} onChange={setRemarks} />
@@ -3193,7 +3228,7 @@ function InventoryScreen({ session, stockItems, stockMovements, persistStockItem
           onToggleActive={() => { toggleItemActive(editingItem); setEditingItem(null); }} />
       )}
       {showMoveForm && (
-        <StockMovementForm item={showMoveForm.item} type={showMoveForm.type} onClose={() => setShowMoveForm(null)} onSave={logMovement} />
+        <StockMovementForm item={showMoveForm.item} type={showMoveForm.type} onClose={() => setShowMoveForm(null)} onSave={logMovement} canBackdate={session.role === "admin"} />
       )}
     </div>
   );
@@ -4045,14 +4080,16 @@ function StockItemForm({ item, onClose, onSave, onToggleActive }) {
   );
 }
 
-function StockMovementForm({ item, type, onClose, onSave }) {
+function StockMovementForm({ item, type, onClose, onSave, canBackdate }) {
   const [quantity, setQuantity] = useState("");
   const [personName, setPersonName] = useState("");
   const [phone, setPhone] = useState("");
   const [company, setCompany] = useState("");
   const [idCard, setIdCard] = useState("");
   const [remarks, setRemarks] = useState("");
-  const [backdate, setBackdate] = useState(false);
+  // Only admins may record a past date/time; everyone else is stamped with the current time.
+  const [backdate, setBackdateRaw] = useState(false);
+  const setBackdate = (v) => setBackdateRaw(canBackdate ? v : false);
   const [bdDate, setBdDate] = useState(todayStr());
   const [bdTime, setBdTime] = useState(nowTimeStr().slice(0, 5));
   const [bdError, setBdError] = useState("");
@@ -4086,7 +4123,9 @@ function StockMovementForm({ item, type, onClose, onSave }) {
       </div>
       <Field label="ID / Card Number (optional)"><input style={inputStyle} value={idCard} onChange={(e) => setIdCard(e.target.value)} placeholder="whatever ID the gate records, if any" /></Field>
 
-      {!backdate ? (
+      {!canBackdate ? (
+        <div style={{ fontSize: 12, color: C.ink50, marginBottom: 14 }}>Recorded at the current time automatically.</div>
+      ) : !backdate ? (
         <button type="button" onClick={() => { setBackdate(true); setBdError(""); }} style={{
           background: "none", border: "none", color: C.navy, fontSize: 12.5, fontWeight: 600,
           cursor: "pointer", textDecoration: "underline", padding: 0, marginBottom: 14, display: "block",
@@ -4992,9 +5031,9 @@ function ShipmentsScreen({ session, shipments, persistShipments, settings, persi
         })}
       </div>
 
-      {showScan && <ManifestScanModal existing={shipments} custom={custom} onClose={() => setShowScan(false)} onSave={receiveBulk} />}
-      {showReceive && <ShipmentReceiveForm existing={shipments} custom={custom} onClose={() => setShowReceive(false)} onSave={receive} />}
-      {releasing && <ShipmentReleaseForm shipment={releasing} onClose={() => setReleasing(null)} onSave={(data) => release(releasing, data)} />}
+      {showScan && <ManifestScanModal existing={shipments} custom={custom} onClose={() => setShowScan(false)} onSave={receiveBulk} canBackdate={session.role === "admin"} />}
+      {showReceive && <ShipmentReceiveForm existing={shipments} custom={custom} onClose={() => setShowReceive(false)} onSave={receive} canBackdate={session.role === "admin"} />}
+      {releasing && <ShipmentReleaseForm shipment={releasing} onClose={() => setReleasing(null)} onSave={(data) => release(releasing, data)} canBackdate={session.role === "admin"} />}
       {noting && <ShipmentNoteModal shipment={noting} onClose={() => setNoting(null)} onSave={(text) => addNote(noting, text)} />}
       {showThreshold && <ShipmentThresholdModal settings={settings} persistSettings={persistSettings} notify={notify} onClose={() => setShowThreshold(false)} />}
       {showCodes && <ShipmentOriginCodesModal settings={settings} persistSettings={persistSettings} notify={notify} onClose={() => setShowCodes(false)} />}
@@ -5155,7 +5194,7 @@ function friendlyScanError(e) {
   return "Scanning didn't work this time. Check your connection and try again, or paste the list.";
 }
 
-function ManifestScanModal({ existing, custom, onClose, onSave }) {
+function ManifestScanModal({ existing, custom, onClose, onSave, canBackdate }) {
   const [step, setStep] = useState("get");
   const [files, setFiles] = useState([]);
   const [previews, setPreviews] = useState([]);
@@ -5169,7 +5208,9 @@ function ManifestScanModal({ existing, custom, onClose, onSave }) {
   const [name, setName] = useState("");
   const [idCard, setIdCard] = useState("");
   const [remarks, setRemarks] = useState("");
-  const [backdate, setBackdate] = useState(false);
+  // Only admins may record a past date/time; everyone else is stamped with the current time.
+  const [backdate, setBackdateRaw] = useState(false);
+  const setBackdate = (v) => setBackdateRaw(canBackdate ? v : false);
   const [bdDate, setBdDate] = useState(todayStr());
   const [bdTime, setBdTime] = useState(nowTimeStr().slice(0, 5));
   const [bdError, setBdError] = useState("");
@@ -5390,8 +5431,12 @@ function ManifestScanModal({ existing, custom, onClose, onSave }) {
         <Field label="Person's name"><input style={inputStyle} value={name} onChange={(e) => setName(e.target.value)} /></Field>
         <Field label="Their ID number"><input style={inputStyle} value={idCard} onChange={(e) => setIdCard(e.target.value)} /></Field>
         <Field label="Remarks (optional)"><input style={inputStyle} value={remarks} onChange={(e) => setRemarks(e.target.value)} placeholder="e.g. flight / manifest number" /></Field>
-        <BackdateDateTime label="Arrived earlier? Set the real date & time" active={backdate} setActive={setBackdate}
-          date={bdDate} setDate={setBdDate} time={bdTime} setTime={setBdTime} error={bdError} setError={setBdError} />
+        {canBackdate ? (
+          <BackdateDateTime label="Arrived earlier? Set the real date & time" active={backdate} setActive={setBackdate}
+            date={bdDate} setDate={setBdDate} time={bdTime} setTime={setBdTime} error={bdError} setError={setBdError} />
+        ) : (
+          <div style={{ fontSize: 12, color: C.ink50, marginBottom: 14 }}>Recorded at the current time automatically.</div>
+        )}
       </div>
 
       <div style={{ fontSize: 12.5, color: C.ink50, marginBottom: 8 }}>{toReceive.length} to receive{skipped > 0 ? ` · ${skipped} skipped (already in warehouse, duplicate, empty or unticked)` : ""}</div>
@@ -5402,14 +5447,16 @@ function ManifestScanModal({ existing, custom, onClose, onSave }) {
   );
 }
 
-function ShipmentReceiveForm({ existing, custom, onClose, onSave }) {
+function ShipmentReceiveForm({ existing, custom, onClose, onSave, canBackdate }) {
   const [arrival, setArrival] = useState("");
   const [awb, setAwb] = useState("");
   const [origin, setOrigin] = useState("");
   const [name, setName] = useState("");
   const [idCard, setIdCard] = useState("");
   const [remarks, setRemarks] = useState("");
-  const [backdate, setBackdate] = useState(false);
+  // Only admins may record a past date/time; everyone else is stamped with the current time.
+  const [backdate, setBackdateRaw] = useState(false);
+  const setBackdate = (v) => setBackdateRaw(canBackdate ? v : false);
   const [bdDate, setBdDate] = useState(todayStr());
   const [bdTime, setBdTime] = useState(nowTimeStr().slice(0, 5));
   const [bdError, setBdError] = useState("");
@@ -5436,19 +5483,25 @@ function ShipmentReceiveForm({ existing, custom, onClose, onSave }) {
       <Field label="Brought By (person's name)"><input style={inputStyle} value={name} onChange={(e) => setName(e.target.value)} /></Field>
       <Field label="Their ID Number"><input style={inputStyle} value={idCard} onChange={(e) => setIdCard(e.target.value)} /></Field>
       <Field label="Remarks (optional)"><input style={inputStyle} value={remarks} onChange={(e) => setRemarks(e.target.value)} placeholder="e.g. 2 cartons, fragile" /></Field>
-      <BackdateDateTime label="Arrived earlier? Set the real date & time" active={backdate} setActive={setBackdate}
-        date={bdDate} setDate={setBdDate} time={bdTime} setTime={setBdTime} error={bdError} setError={setBdError} />
+      {canBackdate ? (
+        <BackdateDateTime label="Arrived earlier? Set the real date & time" active={backdate} setActive={setBackdate}
+          date={bdDate} setDate={setBdDate} time={bdTime} setTime={setBdTime} error={bdError} setError={setBdError} />
+      ) : (
+        <div style={{ fontSize: 12, color: C.ink50, marginBottom: 14 }}>Recorded at the current time automatically.</div>
+      )}
       <Btn full tone="green" icon={DoorOpen} onClick={save} disabled={!(arrival.trim() || awb.trim()) || !name.trim()}>Receive into Warehouse</Btn>
     </Modal>
   );
 }
 
-function ShipmentReleaseForm({ shipment, onClose, onSave }) {
+function ShipmentReleaseForm({ shipment, onClose, onSave, canBackdate }) {
   const [name, setName] = useState("");
   const [staffNo, setStaffNo] = useState("");
   const [destination, setDestination] = useState("");
   const [remarks, setRemarks] = useState("");
-  const [backdate, setBackdate] = useState(false);
+  // Only admins may record a past date/time; everyone else is stamped with the current time.
+  const [backdate, setBackdateRaw] = useState(false);
+  const setBackdate = (v) => setBackdateRaw(canBackdate ? v : false);
   const [bdDate, setBdDate] = useState(todayStr());
   const [bdTime, setBdTime] = useState(nowTimeStr().slice(0, 5));
   const [bdError, setBdError] = useState("");
@@ -5476,8 +5529,12 @@ function ShipmentReleaseForm({ shipment, onClose, onSave }) {
       <Field label="Staff Number (company ID)"><input style={inputStyle} value={staffNo} onChange={(e) => setStaffNo(e.target.value)} /></Field>
       <Field label="Taken To / Destination"><input style={inputStyle} value={destination} onChange={(e) => setDestination(e.target.value)} placeholder="e.g. Abu Dhabi, Dubai" /></Field>
       <Field label="Remarks (optional)"><input style={inputStyle} value={remarks} onChange={(e) => setRemarks(e.target.value)} /></Field>
-      <BackdateDateTime label="Already left? Set the real date & time" active={backdate} setActive={setBackdate}
-        date={bdDate} setDate={setBdDate} time={bdTime} setTime={setBdTime} error={bdError} setError={setBdError} />
+      {canBackdate ? (
+        <BackdateDateTime label="Already left? Set the real date & time" active={backdate} setActive={setBackdate}
+          date={bdDate} setDate={setBdDate} time={bdTime} setTime={setBdTime} error={bdError} setError={setBdError} />
+      ) : (
+        <div style={{ fontSize: 12, color: C.ink50, marginBottom: 14 }}>Recorded at the current time automatically.</div>
+      )}
       <Btn full tone="red" icon={DoorClosed} onClick={save} disabled={!name.trim()}>Release Shipment</Btn>
     </Modal>
   );
