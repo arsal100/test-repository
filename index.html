@@ -11,12 +11,12 @@
   #root { min-height: 100vh; }
   #boot-fallback { min-height: 100vh; display: flex; align-items: center; justify-content: center; font-family: Inter, system-ui, sans-serif; color: #6B7280; flex-direction: column; gap: 10px; text-align: center; padding: 20px; }
 </style>
-<script crossorigin src="https://cdn.jsdelivr.net/npm/react@18/umd/react.production.min.js"></script>
-<script crossorigin src="https://cdn.jsdelivr.net/npm/react-dom@18/umd/react-dom.production.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7/babel.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/firebase@10/firebase-app-compat.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/firebase@10/firebase-auth-compat.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/firebase@10/firebase-firestore-compat.js"></script>
+<script crossorigin src="https://cdn.jsdelivr.net/npm/react@18.3.1/umd/react.production.min.js"></script>
+<script crossorigin src="https://cdn.jsdelivr.net/npm/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7.26.4/babel.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/firebase@10.14.1/firebase-app-compat.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/firebase@10.14.1/firebase-auth-compat.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/firebase@10.14.1/firebase-firestore-compat.js"></script>
 </head>
 <body>
 <div id="root"><div id="boot-fallback">Loading Gatehouse Register…<br/><small>(needs an internet connection the first time, to load React)</small></div></div>
@@ -93,10 +93,10 @@ const Truck = (p) => <IconBase {...p}><rect x="1" y="3" width="15" height="13"/>
 --------------------------------------------------------------------- */
 const C = {
   ink: "#0F172A",       // near-black slate, headers/text
-  navy: "#2563EB",      // vivid blue — primary brand surface
-  slate: "#1E3A8A",     // deeper blue — secondary dark surface
+  navy: "#1F2933",      // vivid blue — primary brand surface
+  slate: "#111827",     // deeper blue — secondary dark surface
   paper: "#F8FAFC",     // clean cool-white background
-  paperDim: "#EEF2FF",  // light indigo-tinted panel background
+  paperDim: "#F3F4F6",  // light indigo-tinted panel background
   line: "#E2E8F0",      // light slate border
   amber: "#F59E0B",     // vivid amber accent
   amberDeep: "#B45309",
@@ -115,6 +115,8 @@ const FONT_MONO = "'JetBrains Mono', 'SF Mono', Consolas, monospace";
 /* ---------------------------------------------------------------------
    PURE HELPERS
 --------------------------------------------------------------------- */
+const isMgmt = (x) => !!x && (x.role === "admin" || x.role === "supervisor");
+const LOADING_VIEWS = ["dashboard", "visitors", "handover", "incidents", "sealreg", "settings"];
 const uid = (p = "") => p + Math.random().toString(36).slice(2, 9) + Date.now().toString(36).slice(-4);
 
 async function sha256(text) {
@@ -360,27 +362,47 @@ function buildShipmentReportPayload(freq, shipments, settings) {
   const { from, to, label } = getPeriodRange(freq);
   const dk = dayKeys();
   const labelOf = (d) => (freq === "daily" ? dayLabelFor(d, dk) : fmtDate(d));
-  const received = shipments.filter((s) => s.date_in >= from && s.date_in <= to);
-  const released = shipments.filter((s) => s.status === "DISPATCHED" && s.date_out && s.date_out >= from && s.date_out <= to);
+  const received = shipments.filter((s) => isArrival(s) && s.date_in >= from && s.date_in <= to);
+  const released = shipments.filter((s) => isRelease(s) && s.date_out && s.date_out >= from && s.date_out <= to);
+  const receivedQty = sumQty(received), releasedQty = sumQty(released);
+  const receivedByCount = receivedQty - received.filter((s) => !isCountRecord(s)).length;
+  const releasedByCount = releasedQty - released.filter((s) => !isCountRecord(s)).length;
+  const damaged = shipments.filter((s) => s.damaged && s.date_in >= from && s.date_in <= to);
+  const whoLine = (s, isOut) => {
+    const day = labelOf(isOut ? s.date_out : s.date_in), time = fmtTime(isOut ? s.time_out : s.time_in);
+    const person = isOut ? s.taken_by_name : s.brought_by_name, pid = isOut ? s.taken_by_id : s.brought_by_id;
+    const what = isCountRecord(s) ? `${shipQty(s)} shipment${shipQty(s) === 1 ? "" : "s"} (count only)` : shipRef(s);
+    return `- ${day} ${time} — ${person || "—"}${pid ? ` (ID ${pid})` : ""}: ${what}${s.damaged ? " [DAMAGED]" : ""}${isOut ? ` → ${s.destination || "—"}` : (s.origin ? ` from ${String(s.origin).toUpperCase()}` : "")}`;
+  };
   const remaining = shipments.filter((s) => s.status === "IN_WAREHOUSE").sort((a, b) => (a.date_in + a.time_in).localeCompare(b.date_in + b.time_in));
   const overdueCount = remaining.filter((s) => shipmentState(s, thresholdDays) === "OVERDUE").length;
   const tally = (list, getKey, fmt) => {
     const m = new Map();
-    list.forEach((s) => { const k = getKey(s) || "—"; m.set(k, (m.get(k) || 0) + 1); });
+    list.forEach((s) => { const k = getKey(s) || "—"; m.set(k, (m.get(k) || 0) + shipQty(s)); });
     return [...m.entries()].sort((a, b) => b[0].localeCompare(a[0])).map(([k, n]) => `- ${fmt ? fmt(k) : k}: ${n}`);
   };
   const freqLabel = { daily: "Daily", weekly: "Weekly", monthly: "Monthly" }[freq] || "Shipment";
 
   const lines = [
     `${freqLabel} Shipment Report`, `Period: ${label}`, "",
-    `Received: ${received.length}`, `Released: ${released.length}`,
+    `Received: ${receivedQty}${receivedByCount ? ` (${receivedQty - receivedByCount} with arrival numbers, ${receivedByCount} counted only)` : ""}`,
+    `Released: ${releasedQty}${releasedByCount ? ` (${releasedQty - releasedByCount} individually recorded, ${releasedByCount} counted only)` : ""}`,
+    damaged.length ? `DAMAGED: ${damaged.length}` : "",
     `Still in warehouse: ${remaining.length}${overdueCount ? ` (${overdueCount} overdue, limit ${thresholdDays} day${thresholdDays === 1 ? "" : "s"})` : ""}`, "",
     received.length ? "Received by origin:" : "",
     ...(received.length ? tally(received, (s) => (s.origin || "").toUpperCase(), (k) => originLabel(k, custom)) : []),
-    released.length ? "" : "", released.length ? "Released — by day they arrived:" : "",
-    ...(released.length ? tally(released, (s) => s.date_in, (k) => labelOf(k)).sort().reverse() : []),
+    released.filter((s) => !isCountRecord(s)).length ? "" : "", released.filter((s) => !isCountRecord(s)).length ? "Released — by day they arrived:" : "",
+    ...(released.filter((s) => !isCountRecord(s)).length ? tally(released.filter((s) => !isCountRecord(s)), (s) => s.date_in, (k) => labelOf(k)).sort().reverse() : []),
     released.length ? "Released — where to:" : "",
     ...(released.length ? tally(released, (s) => s.destination) : []),
+    received.length ? "" : "", received.length ? "Received — who brought them, what time:" : "",
+    ...received.slice().sort((a, b) => (a.date_in + a.time_in).localeCompare(b.date_in + b.time_in)).slice(0, 20).map((x) => whoLine(x, false)),
+    received.length > 20 ? `…and ${received.length - 20} more — see the attached CSV.` : "",
+    released.length ? "" : "", released.length ? "Released — who took them, where, what time:" : "",
+    ...released.slice().sort((a, b) => (a.date_out + a.time_out).localeCompare(b.date_out + b.time_out)).slice(0, 20).map((x) => whoLine(x, true)),
+    released.length > 20 ? `…and ${released.length - 20} more — see the attached CSV.` : "",
+    damaged.length ? "" : "", damaged.length ? "DAMAGED shipments (photos are saved in the app):" : "",
+    ...damaged.slice(0, 15).map((x) => `- ${shipRef(x)}${x.origin ? ` from ${String(x.origin).toUpperCase()}` : ""} — ${x.damage_notes || "no description"} (${(x.photo_ids || []).length} photo${(x.photo_ids || []).length === 1 ? "" : "s"})`),
     remaining.length ? "" : "", remaining.length ? "Still in warehouse — by day they arrived:" : "",
     ...(remaining.length ? tally(remaining, (s) => s.date_in, (k) => labelOf(k)) : []),
     remaining.length ? "" : "", remaining.length ? "Still here (oldest first):" : "",
@@ -397,6 +419,7 @@ function buildShipmentReportPayload(freq, shipments, settings) {
   const rows = [...rowMap.values()].sort((a, b) => (b.date_in + b.time_in).localeCompare(a.date_in + a.time_in));
   const csvHeaders = [
     { label: "Arrival No.", get: (r) => r.arrival_no || "" }, { label: "AWB", get: (r) => r.awb || "" }, { label: "Status", get: (r) => r.status },
+    { label: "Type", get: (r) => (isCountRecord(r) ? "Count only" : "Individual") }, { label: "Quantity", get: (r) => shipQty(r) },
     { label: "Origin Code", get: (r) => r.origin || "" }, { label: "Origin", get: (r) => originName(r.origin, custom) },
     { label: "Arrived Date", get: (r) => r.date_in }, { label: "Arrived Day", get: (r) => dayLabelFor(r.date_in, dk) }, { label: "Time In", get: (r) => r.time_in },
     { label: "Brought By", get: (r) => r.brought_by_name }, { label: "Brought By ID", get: (r) => r.brought_by_id || "" },
@@ -404,14 +427,16 @@ function buildShipmentReportPayload(freq, shipments, settings) {
     { label: "Destination", get: (r) => r.destination || "" },
     { label: "Taken By (Staff)", get: (r) => r.taken_by_name }, { label: "Staff Number", get: (r) => r.taken_by_id || "" },
     { label: "Days in Warehouse", get: (r) => {
+      if (isCountRecord(r)) return "";
       const end = r.status === "DISPATCHED" ? new Date(`${r.date_out}T${r.time_out}`).getTime() : Date.now();
       return (Math.max(0, end - new Date(`${r.date_in}T${r.time_in}`).getTime()) / 86400000).toFixed(1);
     } },
     { label: "Overdue", get: (r) => (shipmentState(r, thresholdDays) === "OVERDUE" ? "Yes" : "") },
     { label: "Why Still Here (notes)", get: (r) => (r.hold_notes || []).map((n) => `${n.date} ${n.by}: ${n.text}`).join(" | ") },
+    { label: "Damaged", get: (r) => (r.damaged ? "Yes" : "") }, { label: "Damage Notes", get: (r) => r.damage_notes || "" }, { label: "Damage Photos", get: (r) => (r.photo_ids || []).length || "" },
   ];
   return {
-    subject: `${freqLabel} Shipment Report — ${label} (${received.length} in, ${released.length} out, ${remaining.length} remaining)`,
+    subject: `${freqLabel} Shipment Report — ${label} (${receivedQty} in, ${releasedQty} out, ${remaining.length} remaining${damaged.length ? `, ${damaged.length} damaged` : ""})`,
     body: lines.join("\n"), csv: toCSV(rows, csvHeaders), filename: `shipments-${freq}-report-${from}_${to}.csv`, label, rowCount: rows.length,
   };
 }
@@ -709,6 +734,7 @@ async function loadStaffProfile(db, firebaseUser) {
     throw new Error("Your staff profile is incomplete: the role is missing. Contact the administrator.");
   }
 
+  if (!["admin","supervisor","manager","guard"].includes(profile.role.trim())) throw new Error("Your staff profile has an unrecognised role. Contact the administrator.");
   const locationIds = Array.isArray(profile.locationIds)
     ? profile.locationIds.filter((id) => typeof id === "string" && id.trim() !== "")
     : [];
@@ -735,19 +761,7 @@ async function loadStaffProfile(db, firebaseUser) {
    buildSampleData: optional, fuller dataset with 15 demo employees and
    sample attendance, available from Settings for testing/demo purposes.
 --------------------------------------------------------------------- */
-async function buildAccounts() {
-  const adminpw = await sha256("manager123");
-  const guardPw = await sha256("guard123");
-  return [
-    { id: "u_admin", group: "Management", name: "Hasrat Murshad Raza", username: "hasrat", passwordHash: adminpw, role: "admin", active: true, created_at: Date.now() },
-    { id: "u_109_g1", group: "Chamber 109", name: "Arslan Ahmed", username: "arslan109", passwordHash: guardPw, role: "guard", active: true, created_at: Date.now() },
-    { id: "u_109_g2", group: "Chamber 109", name: "Amir Hamja", username: "amir109", passwordHash: guardPw, role: "guard", active: true, created_at: Date.now() },
-    { id: "u_102_g1", group: "Chamber 102", name: "Guard 1 (Chamber 102)", username: "guard1_102", passwordHash: guardPw, role: "guard", active: true, created_at: Date.now() },
-    { id: "u_102_g2", group: "Chamber 102", name: "Guard 2 (Chamber 102)", username: "guard2_102", passwordHash: guardPw, role: "guard", active: true, created_at: Date.now() },
-    { id: "u_101_g1", group: "Chamber 101", name: "Guard 1 (Chamber 101)", username: "guard1_101", passwordHash: guardPw, role: "guard", active: true, created_at: Date.now() },
-    { id: "u_101_g2", group: "Chamber 101", name: "Guard 2 (Chamber 101)", username: "guard2_101", passwordHash: guardPw, role: "guard", active: true, created_at: Date.now() },
-  ];
-}
+async function buildAccounts() { return []; }
 // Which login-page group an account appears under (older saves had no `group` field).
 function userGroup(u) {
   if (u.group && u.group.trim()) return u.group.trim();
@@ -805,141 +819,7 @@ async function buildFreshData() {
     incidents: [], shipments: [], settings: defaultSettings(),
   };
 }
-async function buildSampleData() {
-  const users = await buildAccounts();
-  const companies = ["Northgate Logistics", "Vantage Engineering", "Coastal Retail Group"];
-  const depts = ["Operations", "Warehouse", "Finance", "IT", "Maintenance", "HR"];
-  const names = [
-    "James Mwangi", "Alice Wanjiru", "David Njoroge", "Mary Achieng", "John Kamau",
-    "Faith Wambui", "Brian Odhiambo", "Catherine Nyambura", "Kevin Mutua", "Lucy Chebet",
-    "Daniel Kiprono", "Esther Adhiambo", "Michael Wafula", "Grace Auma", "Tom Kilonzo",
-  ];
-  const employees = names.map((name, i) => ({
-    id: uid("e_"),
-    employee_number: `EMP-${String(1001 + i)}`,
-    name,
-    company: companies[i % companies.length],
-    department: depts[i % depts.length],
-    designation: ["Technician", "Clerk", "Supervisor", "Analyst", "Driver", "Officer"][i % 6],
-    phone: `07${String(10000000 + i * 137).slice(0, 8)}`,
-    active: true,
-    created_at: Date.now(),
-    updated_at: Date.now(),
-    demo: true,
-  }));
-
-  const today = todayStr();
-  const attendance = [];
-  const audit = [];
-  // 6 checked out earlier today, one running into overtime
-  [0, 1, 2, 3, 4, 5].forEach((i, idx) => {
-    const timeIn = idx % 3 === 0 ? "06:35:00" : "05:52:00";
-    const timeOut = idx === 0 ? "16:05:00" : "14:1" + idx + ":00"; // idx 0 runs past a 9h shift
-    const mins = minutesBetween(today, timeIn, timeOut);
-    attendance.push({
-      id: uid("a_"), employee_id: employees[i].id, date: today,
-      time_in: timeIn, time_out: timeOut, total_minutes: mins,
-      status: "CHECKED_OUT", checked_in_by: "Arslan Ahmed", checked_out_by: "Amir Hamja",
-      remarks_in: "", remarks_out: "", created_at: Date.now(), updated_at: Date.now(), demo: true,
-    });
-  });
-  // 4 currently inside
-  [6, 7, 8, 9].forEach((i, idx) => {
-    const timeIn = idx === 0 ? "07:10:00" : "06:0" + idx + ":00";
-    attendance.push({
-      id: uid("a_"), employee_id: employees[i].id, date: today,
-      time_in: timeIn, time_out: null, total_minutes: null,
-      status: "INSIDE", checked_in_by: idx % 2 ? "Amir Hamja" : "Arslan Ahmed", checked_out_by: null,
-      remarks_in: idx === 0 ? "Official duty" : "", remarks_out: "",
-      created_at: Date.now(), updated_at: Date.now(), demo: true,
-    });
-  });
-  // yesterday history for a couple employees (for reports/history depth)
-  const y = todayStr(new Date(Date.now() - 86400000));
-  [0, 1, 6, 10].forEach((i, idx) => {
-    const timeIn = "06:1" + idx + ":00";
-    const timeOut = "14:0" + idx + ":00";
-    attendance.push({
-      id: uid("a_"), employee_id: employees[i].id, date: y,
-      time_in: timeIn, time_out: timeOut, total_minutes: minutesBetween(y, timeIn, timeOut),
-      status: "CHECKED_OUT", checked_in_by: "Arslan Ahmed", checked_out_by: "Arslan Ahmed",
-      remarks_in: "", remarks_out: "", created_at: Date.now(), updated_at: Date.now(), demo: true,
-    });
-  });
-
-  const visitors = [
-    {
-      id: uid("v_"), name: "Rashid Al Mazrouei", phone: "0551234567", company: "Gulf Freight Partners",
-      purpose: "Delivery coordination meeting", department: "Operations", host_name: "Arslan Ahmed",
-      pass_number: "VP-1001", id_collected: true, date: today, time_in: "09:15:00", time_out: null,
-      status: "INSIDE", checked_in_by: "Arslan Ahmed", checked_out_by: null, remarks: "", created_at: Date.now(), demo: true,
-    },
-    {
-      id: uid("v_"), name: "Sara Haidari", phone: "0509876543", company: "City Customs Brokers",
-      purpose: "Document collection", department: "Admin", host_name: "Mr Shihabuddin",
-      pass_number: "VP-1000", id_collected: true, date: today, time_in: "08:40:00", time_out: "09:05:00",
-      status: "CHECKED_OUT", checked_in_by: "Amir Hamja", checked_out_by: "Amir Hamja", remarks: "", created_at: Date.now(), demo: true,
-    },
-  ];
-
-  const stockItems = [
-    { id: uid("si_"), name: "Tea", unit: "boxes", min_threshold: 3, active: true, created_at: Date.now(), demo: true },
-    { id: uid("si_"), name: "Sugar", unit: "kg", min_threshold: 5, active: true, created_at: Date.now(), demo: true },
-    { id: uid("si_"), name: "Shipping Tags", unit: "packs", min_threshold: 10, active: true, created_at: Date.now(), demo: true },
-    { id: uid("si_"), name: "Stretch Wrap Rolls", unit: "rolls", min_threshold: 4, active: true, created_at: Date.now(), demo: true },
-  ];
-  const stockMovements = [
-    { id: uid("sm_"), item_id: stockItems[0].id, type: "IN", quantity: 10, date: y, time: "08:30:00", recorded_by: "Arslan Ahmed", remarks: "Supplier delivery", created_at: Date.now(), demo: true },
-    { id: uid("sm_"), item_id: stockItems[0].id, type: "OUT", quantity: 8, date: today, time: "07:50:00", recorded_by: "Amir Hamja", remarks: "Pantry restock", created_at: Date.now(), demo: true },
-    { id: uid("sm_"), item_id: stockItems[1].id, type: "IN", quantity: 20, date: y, time: "08:35:00", recorded_by: "Arslan Ahmed", remarks: "", created_at: Date.now(), demo: true },
-    { id: uid("sm_"), item_id: stockItems[1].id, type: "OUT", quantity: 14, date: today, time: "07:55:00", recorded_by: "Amir Hamja", remarks: "", created_at: Date.now(), demo: true },
-    { id: uid("sm_"), item_id: stockItems[2].id, type: "IN", quantity: 50, date: y, time: "09:00:00", recorded_by: "Arslan Ahmed", remarks: "Warehouse restock", created_at: Date.now(), demo: true },
-    { id: uid("sm_"), item_id: stockItems[2].id, type: "OUT", quantity: 35, date: today, time: "10:10:00", recorded_by: "Arslan Ahmed", remarks: "Issued to dispatch team", created_at: Date.now(), demo: true },
-    { id: uid("sm_"), item_id: stockItems[3].id, type: "IN", quantity: 6, date: y, time: "09:05:00", recorded_by: "Mr Shihabuddin", remarks: "", created_at: Date.now(), demo: true },
-    { id: uid("sm_"), item_id: stockItems[3].id, type: "OUT", quantity: 1, date: today, time: "11:00:00", recorded_by: "Amir Hamja", remarks: "", created_at: Date.now(), demo: true },
-  ];
-
-  const handoverItems = defaultHandoverItems();
-  const handoverRecords = [
-    {
-      id: uid("ho_"), date: y, time_out: "06:00:00", time_in: "06:10:00",
-      outgoing_guard: "Amir Hamja", incoming_guard_expected: "Arslan Ahmed", incoming_guard_confirmed: "Arslan Ahmed",
-      status: "COMPLETED",
-      items: handoverItems.map((it) => ({
-        item_id: it.id, name: it.name, type: it.type,
-        present: it.type === "check" ? true : null,
-        expected_quantity: it.expected_quantity,
-        actual_quantity: it.type === "quantity" ? it.expected_quantity : null,
-      })),
-      remarks_out: "All equipment accounted for.", remarks_in: "Confirmed, nothing missing.",
-      created_at: Date.now(), updated_at: Date.now(), demo: true,
-    },
-  ];
-
-  const settings = {
-    ...defaultSettings(),
-  };
-  const incidents = [
-    {
-      id: uid("inc_"), date: y, time: "13:20:00", type: "Safety Hazard", location: "Loading Bay 2",
-      severity: "Medium", description: "Oil spill near forklift path, cordoned off and cleaned.",
-      people_involved: "", action_taken: "Area cordoned off with cones, cleaning crew notified and spill cleaned within 20 minutes.",
-      status: "Resolved", reported_by: "Arslan Ahmed", resolved_by: "Arslan Ahmed", resolution_notes: "Cleaned and area reopened.",
-      created_at: Date.now(), updated_at: Date.now(), demo: true,
-    },
-  ];
-
-  const d4 = todayStr(new Date(Date.now() - 4 * 86400000));
-  const blankOut = { date_out: null, time_out: null, taken_by_name: "", taken_by_company: "", taken_by_phone: "", taken_by_id: "", released_by: null, remarks_out: "" };
-  const shipments = [
-    { id: uid("sh_"), arrival_no: "1042215", origin: "AUH", awb: "176-48201935", status: "IN_WAREHOUSE", date_in: d4, time_in: "10:20:00", brought_by_name: "Rashid Al Mazrouei", brought_by_company: "Gulf Freight Partners", brought_by_phone: "0551234567", brought_by_id: "", received_by: "Arslan Ahmed", remarks_in: "2 cartons", ...blankOut, created_at: Date.now(), updated_at: Date.now(), demo: true },
-    { id: uid("sh_"), arrival_no: "1042301", origin: "LON", awb: "176-48205567", status: "IN_WAREHOUSE", date_in: y, time_in: "15:40:00", brought_by_name: "Sara Haidari", brought_by_company: "City Customs Brokers", brought_by_phone: "0509876543", brought_by_id: "", received_by: "Amir Hamja", remarks_in: "", ...blankOut, created_at: Date.now(), updated_at: Date.now(), demo: true },
-    { id: uid("sh_"), arrival_no: "1042188", origin: "BOM", awb: "157-30918822", status: "DISPATCHED", date_in: y, time_in: "09:05:00", brought_by_name: "Rashid Al Mazrouei", brought_by_company: "Gulf Freight Partners", brought_by_phone: "", brought_by_id: "", received_by: "Arslan Ahmed", remarks_in: "",
-      date_out: today, time_out: "08:30:00", taken_by_name: "Sara Haidari", taken_by_company: "City Customs Brokers", taken_by_phone: "0509876543", taken_by_id: "", released_by: "Amir Hamja", remarks_out: "", created_at: Date.now(), updated_at: Date.now(), demo: true },
-  ];
-
-  return { users, employees, attendance, audit, leaves: [], visitors, stockItems, stockMovements, handoverItems, handoverRecords, incidents, shipments, settings };
-}
+async function buildSampleData() { return await buildFreshData(); }
 
 /* ---------------------------------------------------------------------
    SMALL UI PRIMITIVES
@@ -1102,8 +982,11 @@ function App() {
   const [firebaseError, setFirebaseError] = useState("");
   const [activeLocationId, setActiveLocationId] = useState(null); // Firebase mode only
   const [dataError, setDataError] = useState("");
+  const [roster, setRoster] = useState([]); // guards at the active location (Firebase mode)
   const activeLocationIdRef = useRef(null); activeLocationIdRef.current = activeLocationId;
   const dbApiRef = useRef(null);
+  const [vw, setVw] = useState(window.innerWidth);
+  useEffect(() => { const f = () => setVw(window.innerWidth); window.addEventListener("resize", f); return () => window.removeEventListener("resize", f); }, []);
   const authApiRef = useRef(null);
   const dbModeRef = useRef("local");
   const employeesRef = useRef(employees); employeesRef.current = employees;
@@ -1315,6 +1198,7 @@ function App() {
   // error is re-thrown so callers do not report success.
   const saveRecords = async (name, storageKey, setter, ref, next) => {
     const prev = ref.current;
+    if (session && session.role === "manager") { const m = "Read-only access: managers cannot change records."; notify(m, "error"); throw new Error(m); }
     setter(next);
     const db = dbApiRef.current;
 
@@ -1368,6 +1252,7 @@ function App() {
     },
     settings: async (next) => {
       const prevSettings = settings;
+      if (session && session.role === "manager") { const m = "Read-only access: managers cannot change settings."; notify(m, "error"); throw new Error(m); }
       setSettings(next);
       const db = dbApiRef.current;
 
@@ -1446,6 +1331,37 @@ function App() {
       }
     }));
   };
+
+  // FIREBASE MODE: roster of guards at the active location. Used for the
+  // handover "incoming guard" list (other users' staff profiles are private).
+  useEffect(() => {
+    const db = dbApiRef.current;
+
+    if (dbModeRef.current !== "firebase" || !db || !session || !activeLocationId) {
+      setRoster([]);
+      return undefined;
+    }
+
+    let cancelled = false;
+    const stop = db.collection(`locations/${activeLocationId}/roster`).onSnapshot(
+      (snap) => { if (!cancelled) setRoster(snap.docs.map((d) => ({ ...d.data(), id: d.id }))); },
+      (err) => { console.warn("Roster read failed:", err); if (!cancelled) setRoster([]); }
+    );
+
+    return () => { cancelled = true; try { stop(); } catch (e) { /* ignore */ } };
+  }, [session, activeLocationId]);
+
+  // Each guard adds their own entry to the roster of every location they work at.
+  useEffect(() => {
+    const db = dbApiRef.current;
+    if (dbModeRef.current !== "firebase" || !db || !session || !["guard","supervisor"].includes(session.role)) return;
+
+    (session.locationIds || []).forEach((locationId) => {
+      db.doc(`locations/${locationId}/roster/${session.id}`)
+        .set({ id: session.id, name: session.name, role: session.role, active: true, updated_at: Date.now() })
+        .catch((e) => console.warn("Roster update failed:", locationId, e));
+    });
+  }, [session]);
 
   // FIREBASE MODE: live subscriptions for the active location only.
   // Re-runs (and cleanly unsubscribes) when the location changes or the
@@ -1553,9 +1469,14 @@ function getLocationCollection(db, locationId, collectionName) {
     const a = document.createElement("a");
     a.href = mailto; a.target = "_blank";
     document.body.appendChild(a); a.click(); document.body.removeChild(a);
-    await persist.settings({ ...settings, report_channels: { ...channels, [section]: { ...ch, last_sent: todayStr() } } });
+    // "last sent" is stored in the settings, which only admins may change; for everyone else just skip it.
+    if (session && isMgmt(session)) {
+      try {
+        await persist.settings({ ...settings, report_channels: { ...channels, [section]: { ...ch, last_sent: todayStr() } } });
+      } catch (e) { /* the failed save already showed an error */ }
+    }
     notify(`${payload.label} ${sectionLabel.toLowerCase()} report ready — check your email app`);
-  }, [settings, employees, attendance, empById, visitors, stockItems, stockMovements, shipments, notify]);
+  }, [settings, employees, attendance, empById, visitors, stockItems, stockMovements, shipments, notify, session]);
 
   if (!booted) {
     return (
@@ -1571,7 +1492,7 @@ function getLocationCollection(db, locationId, collectionName) {
   return <LoginScreen authError={firebaseError} onClearAuthError={() => setFirebaseError("")} notify={notify} />;
   }
   return (
-    <div style={{ minHeight: "100vh", background: C.paper, fontFamily: FONT_SANS, paddingBottom: 76 }}>
+    <div style={{ minHeight: "100vh", background: C.paper, fontFamily: FONT_SANS, paddingBottom: vw >= 640 ? 0 : 76, paddingLeft: vw >= 1024 ? 220 : vw >= 640 ? 76 : 0 }}>
       <style>{`
         @media print {
           .no-print { display: none !important; }
@@ -1608,7 +1529,7 @@ function getLocationCollection(db, locationId, collectionName) {
           You can see live data here, but can't save changes yet — ask whoever owns this page to give you edit access (see Settings for details).
         </div>
       )}
-      <main style={{ maxWidth: 1100, margin: "0 auto", padding: "18px 16px 30px" }}>
+      <main style={{ maxWidth: vw >= 1024 ? 1440 : 1100, margin: "0 auto", padding: vw >= 1024 ? "24px 32px 40px" : "18px 16px 30px" }}>
         {view === "dashboard" && (
           <Dashboard
             session={session} employees={employees} attendance={attendance} settings={settings}
@@ -1656,22 +1577,23 @@ function getLocationCollection(db, locationId, collectionName) {
           <SealRegisterScreen session={session} getDb={() => dbApiRef.current} firebaseMode={dbModeRef.current === "firebase"} notify={notify} />
         )}
         {view === "handover" && (
-          <HandoverScreen session={session} users={users} handoverItems={handoverItems} handoverRecords={handoverRecords}
+          <HandoverScreen session={session} users={users} roster={roster} handoverItems={handoverItems} handoverRecords={handoverRecords}
             persistHandoverItems={persist.handoverItems} persistHandoverRecords={persist.handoverRecords}
             settings={settings} persistSettings={persist.settings} notify={notify} />
         )}
         {view === "shipments" && (
           <ShipmentsScreen session={session} shipments={shipments} persistShipments={persist.shipments}
-            settings={settings} persistSettings={persist.settings} notify={notify} sendReport={sendReport} />
+            settings={settings} persistSettings={persist.settings} notify={notify} sendReport={sendReport}
+            getDb={() => dbApiRef.current} firebaseMode={dbModeRef.current === "firebase"} activeLocationId={activeLocationId} />
         )}
         {view === "incidents" && (
           <IncidentsScreen session={session} incidents={incidents} persistIncidents={persist.incidents}
             settings={settings} persistSettings={persist.settings} notify={notify} />
         )}
-        {view === "employees" && session.role === "admin" && (
+        {view === "employees" && ["admin","supervisor","manager"].includes(session.role) && (
           <EmployeesScreen employees={employees} persistEmployees={persist.employees} notify={notify} />
         )}
-        {view === "reports" && session.role === "admin" && (
+        {view === "reports" && ["admin","supervisor","manager"].includes(session.role) && (
           <ReportsScreen employees={employees} attendance={attendance} empById={empById} settings={settings} />
         )}
         {view === "settings" && session.role === "admin" && (
@@ -1715,7 +1637,7 @@ function getLocationCollection(db, locationId, collectionName) {
           />
         )}
       </main>
-      <BottomNav view={view} setView={setView} role={session.role} canSealRegister={canUseSealRegister(session)} />
+      <BottomNav view={view} setView={setView} role={session.role} canSealRegister={canUseSealRegister(session)} vw={vw} locationId={activeLocationId} />
     </div>
   );
 }
@@ -1780,40 +1702,41 @@ function Header({ session, onLogout, syncMode, canWriteShared, activeLocationId,
   );
 }
 
-function BottomNav({ view, setView, role, canSealRegister }) {
+function BottomNav({ view, setView, role, canSealRegister, vw, locationId }) {
   const items = [
-    { id: "dashboard", label: "Dashboard", icon: Home, roles: ["admin", "guard"] },
-    { id: "checkin", label: "Check In", icon: DoorOpen, roles: ["admin", "guard"] },
-    { id: "checkout", label: "Check Out", icon: DoorClosed, roles: ["admin", "guard"] },
-    { id: "attendance", label: "Today", icon: ClipboardList, roles: ["admin", "guard"] },
-    { id: "history", label: "History", icon: CalendarDays, roles: ["admin", "guard"] },
-    { id: "leave", label: "Leave", icon: UserX, roles: ["admin", "guard"] },
-    { id: "visitors", label: "Visitors", icon: UserPlus, roles: ["admin", "guard"] },
-    { id: "inventory", label: "Inventory", icon: Package, roles: ["admin", "guard"] },
-    { id: "shipments", label: "Shipments", icon: Truck, roles: ["admin", "guard"] },
-    { id: "sealreg", label: "Seal Register", icon: ShieldCheck, roles: ["admin", "guard"], show: !!canSealRegister },
-    { id: "handover", label: "Handover", icon: RefreshCw, roles: ["admin", "guard"] },
-    { id: "incidents", label: "Incidents", icon: AlertTriangle, roles: ["admin", "guard"] },
-    { id: "employees", label: "Employees", icon: Users, roles: ["admin"] },
-    { id: "reports", label: "Reports", icon: BarChart3, roles: ["admin"] },
+    { id: "dashboard", label: "Dashboard", icon: Home, roles: ["admin","supervisor","manager","guard"] },
+    { id: "checkin", label: "Check In", icon: DoorOpen, roles: ["admin","supervisor","guard"] },
+    { id: "checkout", label: "Check Out", icon: DoorClosed, roles: ["admin","supervisor","guard"] },
+    { id: "attendance", label: "Today", icon: ClipboardList, roles: ["admin","supervisor","manager","guard"] },
+    { id: "history", label: "History", icon: CalendarDays, roles: ["admin","supervisor","manager","guard"] },
+    { id: "leave", label: "Leave", icon: UserX, roles: ["admin","supervisor","manager","guard"] },
+    { id: "visitors", label: "Visitors", icon: UserPlus, roles: ["admin","supervisor","manager","guard"] },
+    { id: "inventory", label: "Inventory", icon: Package, roles: ["admin","supervisor","manager","guard"] },
+    { id: "shipments", label: "Shipments", icon: Truck, roles: ["admin","supervisor","manager","guard"] },
+    { id: "sealreg", label: "Seal Register", icon: ShieldCheck, roles: ["admin","supervisor","manager","guard"], show: !!canSealRegister },
+    { id: "handover", label: "Handover", icon: RefreshCw, roles: ["admin","supervisor","manager","guard"] },
+    { id: "incidents", label: "Incidents", icon: AlertTriangle, roles: ["admin","supervisor","manager","guard"] },
+    { id: "employees", label: "Employees", icon: Users, roles: ["admin","supervisor","manager"] },
+    { id: "reports", label: "Reports", icon: BarChart3, roles: ["admin","supervisor","manager"] },
     { id: "settings", label: "Settings", icon: SettingsIcon, roles: ["admin"] },
-  ].filter((i) => i.roles.includes(role) && i.show !== false);
+  ].filter((i) => i.roles.includes(role) && i.show !== false && (locationId !== SEAL_LOCATION_ID || LOADING_VIEWS.includes(i.id)));
 
   return (
-    <nav className="no-print" style={{
+    <nav className="no-print" style={vw >= 640 ? { position: "fixed", top: 0, bottom: 0, left: 0, width: vw >= 1024 ? 220 : 76, background: C.slate, display: "flex", flexDirection: "column", overflowY: "auto", zIndex: 45 } : {
       position: "fixed", bottom: 0, left: 0, right: 0, background: "#fff", borderTop: `1px solid ${C.line}`,
       display: "flex", overflowX: "auto", zIndex: 40, boxShadow: "0 -4px 14px rgba(15,23,42,0.08)",
     }}>
+      {vw >= 640 && <div style={{ padding: "16px 14px 14px", color: "#fff", fontWeight: 800, letterSpacing: 1, fontSize: vw >= 1024 ? 19 : 11 }}><span style={{ color: C.aramexRed }}>ARAMEX</span>{vw >= 1024 && <div style={{ fontSize: 11, fontWeight: 500, opacity: 0.7, letterSpacing: 0 }}>Gatehouse Register</div>}</div>}
       {items.map((it) => {
         const active = view === it.id;
         return (
           <button key={it.id} onClick={() => setView(it.id)} style={{
-            flex: "1 0 auto", minWidth: 68, display: "flex", flexDirection: "column", alignItems: "center",
-            gap: 3, padding: "9px 8px 8px", background: "none", border: "none", cursor: "pointer",
-            color: active ? C.aramexRed : C.ink50, borderTop: active ? `2px solid ${C.aramexRed}` : "2px solid transparent",
+            flex: vw >= 640 ? "0 0 auto" : "1 0 auto", minWidth: vw >= 640 ? 0 : 68, display: "flex", flexDirection: vw >= 1024 ? "row" : "column", alignItems: "center",
+            gap: vw >= 1024 ? 12 : 3, padding: vw >= 1024 ? "11px 18px" : "9px 8px 8px", background: vw >= 640 && active ? C.aramexRed : "none", border: "none", cursor: "pointer",
+            color: vw >= 640 ? (active ? "#fff" : "#CBD5E1") : (active ? C.aramexRed : C.ink50), borderTop: vw >= 640 ? "none" : (active ? `2px solid ${C.aramexRed}` : "2px solid transparent"),
           }}>
             <it.icon size={19} />
-            <span style={{ fontSize: 10.5, fontFamily: FONT_SANS, fontWeight: 600 }}>{it.label}</span>
+            <span style={{ fontSize: vw >= 1024 ? 13.5 : 10.5, fontFamily: FONT_SANS, fontWeight: 600 }}>{it.label}</span>
           </button>
         );
       })}
@@ -2070,7 +1993,7 @@ function Dashboard({ session, employees, attendance, settings, empById, today, g
   const overdueShipments = shipmentsInWh.filter((x) => shipmentState(x, shipThreshold) === "OVERDUE");
 
   const channels = settings.report_channels || { attendance: defaultChannel(), security: defaultChannel(), inventory: defaultChannel(), shipments: defaultChannel() };
-  const dueSections = session.role === "admin"
+  const dueSections = isMgmt(session)
     ? ["attendance", "security", "inventory", "shipments"].filter((s) => isReportDue(channels[s]))
     : [];
   const sectionLabel = { attendance: "Attendance", security: "Security", inventory: "Inventory", shipments: "Shipments" };
@@ -2114,7 +2037,14 @@ function Dashboard({ session, employees, attendance, settings, empById, today, g
         </div>
       )}
 
-      {(handoverRecords || []).some((r) => r.status === "PENDING") && (
+      {(session.role === "guard" || session.role === "supervisor") && (
+        <div style={{ background: "#fff", border: `2px solid ${C.aramexRed}`, borderRadius: 12, padding: "14px 16px", marginBottom: 12, display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, flexWrap: "wrap" }}>
+          <div><div style={{ fontWeight: 800, fontSize: 15 }}>Shift Handover</div><div style={{ fontSize: 12.5, color: C.ink50 }}>Ending your shift? Choose the incoming guard and complete the checklist.</div></div>
+          <Btn tone="red" icon={RefreshCw} onClick={() => { window.__startHandover = true; goto("handover"); }}>Start Shift Handover</Btn>
+        </div>
+      )}
+
+      {(handoverRecords || []).some((r) => r.status === "PENDING" && r.incoming_uid === session.id) && (
         <div style={{ background: "#FEF3C7", border: `1px solid #FDE68A`, borderRadius: 10, padding: "12px 14px", marginBottom: 12, display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, flexWrap: "wrap" }}>
           <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
             <RefreshCw size={18} color={C.amberDeep} />
@@ -2182,7 +2112,7 @@ function Dashboard({ session, employees, attendance, settings, empById, today, g
       )}
 
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 22 }}>
-        <StatCard label="Total Employees" value={activeEmployees.length} icon={Users} tone="red" onClick={session.role === "admin" ? () => goto("employees") : undefined} />
+        <StatCard label="Total Employees" value={activeEmployees.length} icon={Users} tone="red" onClick={isMgmt(session) ? () => goto("employees") : undefined} />
         <StatCard label="Checked In Today" value={todays.length} icon={CalendarDays} tone="teal" onClick={() => goto("attendance")} />
         <StatCard label="Currently Inside" value={inside.length} icon={Clock} tone="amber" onClick={() => goto("attendance")} />
         <StatCard label="Checked Out Today" value={checkedOutToday.length} icon={DoorClosed} tone="slate" onClick={() => goto("attendance")} />
@@ -2347,7 +2277,7 @@ function CheckInScreen({ session, employees, attendance, settings, leaves, persi
   const [submitting, setSubmitting] = useState(false);
   const [success, setSuccess] = useState(null);
   // Only admins may record a past date/time. Everyone else is always stamped with the current time.
-  const canBackdate = session.role === "admin";
+  const canBackdate = isMgmt(session);
   const [backdate, setBackdateRaw] = useState(false);
   const setBackdate = (v) => setBackdateRaw(canBackdate ? v : false);
   const [bdDate, setBdDate] = useState(todayStr());
@@ -2568,7 +2498,7 @@ function CheckOutScreen({ session, employees, attendance, settings, persistAtten
   const [submitting, setSubmitting] = useState(false);
   const [success, setSuccess] = useState(null);
   // Only admins may record a past date/time. Everyone else is always stamped with the current time.
-  const canBackdate = session.role === "admin";
+  const canBackdate = isMgmt(session);
   const [backdate, setBackdateRaw] = useState(false);
   const setBackdate = (v) => setBackdateRaw(canBackdate ? v : false);
   const [bdDate, setBdDate] = useState(todayStr());
@@ -2855,7 +2785,7 @@ function HistoryScreen({ employees, attendance, empById, session, persistAttenda
                 <Td><StatusBadge a={r} shiftHours={settings.shift_hours} /></Td>
                 <Td>{r.status === "INSIDE" ? r.checked_in_by : r.checked_out_by}</Td>
                 <Td>{[r.remarks_in, r.remarks_out].filter(Boolean).join(" / ") || "—"}</Td>
-                <Td>{session.role === "admin" && (
+                <Td>{isMgmt(session) && (
                   <button onClick={() => setEditing(r)} style={{ background: "none", border: "none", color: C.navy, cursor: "pointer" }} title="Correct record"><Edit3 size={15} /></button>
                 )}</Td>
               </tr>
@@ -3145,7 +3075,7 @@ function InventoryScreen({ session, stockItems, stockMovements, persistStockItem
   return (
     <div>
       <SectionTitle title="Inventory" sub={`${activeItems.length} item(s) tracked${lowStock.length ? ` · ${lowStock.length} low` : ""}`}
-        action={session.role === "admin" ? { label: "+ Add Item", onClick: () => setShowItemForm(true) } : undefined} />
+        action={isMgmt(session) ? { label: "+ Add Item", onClick: () => setShowItemForm(true) } : undefined} />
 
       {lowStock.length > 0 && (
         <div style={{ background: "#F7E7E5", border: `1px solid #E9C3BE`, borderRadius: 10, padding: "12px 14px", marginBottom: 16 }}>
@@ -3162,7 +3092,7 @@ function InventoryScreen({ session, stockItems, stockMovements, persistStockItem
       )}
 
       <div style={{ display: "flex", gap: 6, marginBottom: 12 }}>
-        {[["items", "Items"], ["history", "Movement History"], ...(session.role === "admin" ? [["insights", "Usage & Reports"]] : [])].map(([k, label]) => (
+        {[["items", "Items"], ["history", "Movement History"], ...(isMgmt(session) ? [["insights", "Usage & Reports"]] : [])].map(([k, label]) => (
           <button key={k} onClick={() => setTab(k)} style={{
             padding: "7px 12px", borderRadius: 20, fontSize: 12.5, fontWeight: 600, cursor: "pointer",
             border: `1px solid ${tab === k ? C.navy : C.line}`, background: tab === k ? C.navy : "#fff", color: tab === k ? "#fff" : C.ink,
@@ -3170,11 +3100,11 @@ function InventoryScreen({ session, stockItems, stockMovements, persistStockItem
         ))}
       </div>
 
-      {tab === "insights" && session.role === "admin" ? (
+      {tab === "insights" && isMgmt(session) ? (
         <InventoryInsights settings={settings} stockItems={stockItems} stockMovements={stockMovements} activeLocationId={activeLocationId} locationIds={locationIds} loadLocationStock={loadLocationStock} notify={notify} />
       ) : tab === "items" ? (
         <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-          {withLevels.length === 0 ? <EmptyState icon={Package} title="No inventory items yet" sub={session.role === "admin" ? "Tap + Add Item to start tracking stock" : "Ask admin to add items to track"} /> : (
+          {withLevels.length === 0 ? <EmptyState icon={Package} title="No inventory items yet" sub={isMgmt(session) ? "Tap + Add Item to start tracking stock" : "Ask admin to add items to track"} /> : (
             withLevels.sort((a, b) => (a.level <= a.min_threshold ? -1 : 1) - (b.level <= b.min_threshold ? -1 : 1)).map((i) => (
               <div key={i.id} style={{ background: "#fff", border: `1px solid ${i.level <= i.min_threshold ? "#E9C3BE" : C.line}`, borderRadius: 10, padding: "12px 14px" }}>
                 <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 8 }}>
@@ -3187,7 +3117,7 @@ function InventoryScreen({ session, stockItems, stockMovements, persistStockItem
                       <span style={{ fontFamily: FONT_MONO, color: C.ink, fontWeight: 600 }}>{i.level} {i.unit}</span> on hand · minimum {i.min_threshold} {i.unit}
                     </div>
                   </div>
-                  {session.role === "admin" && (
+                  {isMgmt(session) && (
                     <button onClick={() => setEditingItem(i)} style={{ background: "none", border: "none", color: C.navy, cursor: "pointer" }}><Edit3 size={15} /></button>
                   )}
                 </div>
@@ -3228,7 +3158,7 @@ function InventoryScreen({ session, stockItems, stockMovements, persistStockItem
           onToggleActive={() => { toggleItemActive(editingItem); setEditingItem(null); }} />
       )}
       {showMoveForm && (
-        <StockMovementForm item={showMoveForm.item} type={showMoveForm.type} onClose={() => setShowMoveForm(null)} onSave={logMovement} canBackdate={session.role === "admin"} />
+        <StockMovementForm item={showMoveForm.item} type={showMoveForm.type} onClose={() => setShowMoveForm(null)} onSave={logMovement} canBackdate={isMgmt(session)} />
       )}
     </div>
   );
@@ -3248,7 +3178,7 @@ const SEAL_CHAMBERS = ["DFC-101", "DFC-102", "DFC-107", "DFC-109"];
 
 function canUseSealRegister(session) {
   if (!session) return false;
-  if (session.role === "admin") return true;
+  if (isMgmt(session) || session.role === "manager") return true;
   return Array.isArray(session.locationIds) && session.locationIds.includes(SEAL_LOCATION_ID);
 }
 
@@ -3469,7 +3399,7 @@ function SealForm({ direction, onClose, onSave }) {
 }
 
 function SealRegisterScreen({ session, getDb, firebaseMode, notify }) {
-  const isAdmin = session.role === "admin";
+  const isAdmin = isMgmt(session);
   const hasAccess = firebaseMode && Array.isArray(session.locationIds) && session.locationIds.includes(SEAL_LOCATION_ID);
   const base = `locations/${SEAL_LOCATION_ID}`;
 
@@ -4158,11 +4088,12 @@ function StockMovementForm({ item, type, onClose, onSave, canBackdate }) {
    Anything missing is flagged immediately and can be emailed straight to
    a manager rather than waiting for a scheduled report.
 --------------------------------------------------------------------- */
-function HandoverScreen({ session, users, handoverItems, handoverRecords, persistHandoverItems, persistHandoverRecords, settings, persistSettings, notify }) {
+function HandoverScreen({ session, users, roster, handoverItems, handoverRecords, persistHandoverItems, persistHandoverRecords, settings, persistSettings, notify }) {
   const [tab, setTab] = useState("current");
   const [showStart, setShowStart] = useState(false);
   const [takingOver, setTakingOver] = useState(null);
   const [managingItems, setManagingItems] = useState(false);
+  useEffect(() => { if (window.__startHandover) { window.__startHandover = false; setShowStart(true); } }, []);
 
   const pending = handoverRecords.find((r) => r.status === "PENDING");
   const activeItems = handoverItems.filter((i) => i.active);
@@ -4173,7 +4104,7 @@ function HandoverScreen({ session, users, handoverItems, handoverRecords, persis
     const missing = data.items.filter((it) => !handoverItemOk(it));
     const rec = {
       id: uid("ho_"), date: todayStr(now), time_out: nowTimeStr(now), time_in: null,
-      outgoing_guard: session.name, incoming_guard_expected: data.incoming_guard_expected, incoming_guard_confirmed: null,
+      outgoing_guard: session.name, outgoing_uid: session.id, incoming_uid: data.incoming_uid, incoming_guard_expected: data.incoming_guard_expected, incoming_guard_confirmed: null,
       status: "PENDING", items: data.items, remarks_out: data.remarks, remarks_in: "",
       created_at: Date.now(), updated_at: Date.now(),
     };
@@ -4185,7 +4116,7 @@ function HandoverScreen({ session, users, handoverItems, handoverRecords, persis
 
   const completeTakeover = async (remarksIn, updatedItems) => {
     const now = new Date();
-    const updated = { ...pending, status: "COMPLETED", time_in: nowTimeStr(now), incoming_guard_confirmed: session.name, remarks_in: remarksIn, items: updatedItems, updated_at: Date.now() };
+    const updated = { ...pending, status: "COMPLETED", time_in: nowTimeStr(now), incoming_guard_confirmed: session.name, incoming_confirmed_uid: session.id, remarks_in: remarksIn, items: updatedItems, updated_at: Date.now() };
     await persistHandoverRecords(handoverRecords.map((r) => (r.id === pending.id ? updated : r)));
     setTakingOver(null);
     notify("Shift taken over");
@@ -4212,7 +4143,7 @@ function HandoverScreen({ session, users, handoverItems, handoverRecords, persis
   return (
     <div>
       <SectionTitle title="Shift Handover" sub={pending ? "A handover is waiting to be taken over" : "No handover currently pending"}
-        action={session.role === "admin" ? { label: "Manage Checklist", onClick: () => setManagingItems(true) } : undefined} />
+        action={isMgmt(session) ? { label: "Manage Checklist", onClick: () => setManagingItems(true) } : undefined} />
 
       <div style={{ display: "flex", gap: 6, marginBottom: 14 }}>
         {[["current", "Current"], ["history", "History"]].map(([k, label]) => (
@@ -4252,7 +4183,7 @@ function HandoverScreen({ session, users, handoverItems, handoverRecords, persis
                   <Btn size="sm" tone="red" onClick={() => sendMissingAlert(pending)}>Alert Manager</Btn>
                 </div>
               )}
-              <Btn full tone="amber" icon={RefreshCw} onClick={() => setTakingOver(pending)}>Take Over Shift</Btn>
+              {pending.incoming_uid === session.id ? <Btn full tone="amber" icon={RefreshCw} onClick={() => setTakingOver(pending)}>Take Over Shift</Btn> : <div style={{ fontSize: 12.5, color: C.ink50 }}>Waiting for {pending.incoming_guard_expected || "the assigned guard"} to take over.</div>}
             </div>
           ) : (
             <div style={{ marginBottom: 16 }}>
@@ -4260,7 +4191,7 @@ function HandoverScreen({ session, users, handoverItems, handoverRecords, persis
             </div>
           )}
 
-          <Btn full tone="navy" icon={DoorOpen} onClick={() => setShowStart(true)} disabled={!!pending}>
+          <Btn full tone="navy" icon={DoorOpen} onClick={() => setShowStart(true)} disabled={!!pending || session.role === "manager"}>
             {pending ? "Complete the pending takeover first" : "+ Start Handover (End of My Shift)"}
           </Btn>
         </div>
@@ -4284,7 +4215,7 @@ function HandoverScreen({ session, users, handoverItems, handoverRecords, persis
         </div>
       )}
 
-      {showStart && <HandoverForm items={activeItems} users={users} session={session} onClose={() => setShowStart(false)} onSave={startHandover} />}
+      {showStart && <HandoverForm items={activeItems} users={users} roster={roster} session={session} onClose={() => setShowStart(false)} onSave={startHandover} />}
       {takingOver && <TakeoverForm record={takingOver} onClose={() => setTakingOver(null)} onConfirm={completeTakeover} />}
       {managingItems && (
         <HandoverItemsManager items={handoverItems} persistItems={persistHandoverItems}
@@ -4294,22 +4225,28 @@ function HandoverScreen({ session, users, handoverItems, handoverRecords, persis
   );
 }
 
-function HandoverForm({ items, users, session, onClose, onSave }) {
+function HandoverForm({ items, users, roster, session, onClose, onSave }) {
   const [state, setState] = useState(() => Object.fromEntries(items.map((i) => [i.id, i.type === "check" ? true : i.expected_quantity])));
   const [incomingGuard, setIncomingGuard] = useState("");
+  const [otherName, setOtherName] = useState("");
   const [remarks, setRemarks] = useState("");
+  const OTHER = "__other__";
 
-  const otherUsers = users.filter((u) => u.active && u.name !== session.name);
+  // Guards from the old accounts list plus the location roster (Firebase mode), without duplicates or yourself.
+  const guardOptions = (roster || []).filter((r) => r.active !== false && r.name && r.id !== session.id).sort((a, b) => a.name.localeCompare(b.name));
+  const guardNames = guardOptions.map((g) => g.name);
+
+  const chosenGuard = (guardOptions.find((g) => g.id === incomingGuard) || {}).name || "";
 
   const save = () => {
-    if (!incomingGuard.trim()) return;
+    if (!chosenGuard) return;
     const builtItems = items.map((i) => ({
       item_id: i.id, name: i.name, type: i.type,
       present: i.type === "check" ? !!state[i.id] : null,
       expected_quantity: i.expected_quantity,
       actual_quantity: i.type === "quantity" ? Number(state[i.id]) : null,
     }));
-    onSave({ incoming_guard_expected: incomingGuard.trim(), remarks: remarks.trim(), items: builtItems });
+    onSave({ incoming_guard_expected: chosenGuard, incoming_uid: incomingGuard, remarks: remarks.trim(), items: builtItems });
   };
 
   return (
@@ -4317,9 +4254,16 @@ function HandoverForm({ items, users, session, onClose, onSave }) {
       <Field label="Incoming guard">
         <select style={inputStyle} value={incomingGuard} onChange={(e) => setIncomingGuard(e.target.value)}>
           <option value="">Select…</option>
-          {otherUsers.map((u) => <option key={u.id} value={u.name}>{u.name}</option>)}
+          {guardOptions.map((g) => <option key={g.id} value={g.id}>{g.name}</option>)}
+          
         </select>
       </Field>
+      {incomingGuard === OTHER && (
+        <Field label="Incoming guard's name"><input style={inputStyle} value={otherName} onChange={(e) => setOtherName(e.target.value)} placeholder="Full name" autoFocus /></Field>
+      )}
+      {guardNames.length === 0 && (
+        <div style={{ fontSize: 12, color: C.ink50, marginBottom: 10, lineHeight: 1.5 }}>No other guards are listed yet — a guard appears here after their first login. Choose “Someone else” and type the name.</div>
+      )}
       <div style={{ fontSize: 12.5, fontWeight: 600, color: C.ink50, margin: "6px 0" }}>CHECKLIST</div>
       <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: 14 }}>
         {items.map((i) => (
@@ -4340,7 +4284,7 @@ function HandoverForm({ items, users, session, onClose, onSave }) {
         ))}
       </div>
       <Field label="Remarks (optional)"><input style={inputStyle} value={remarks} onChange={(e) => setRemarks(e.target.value)} /></Field>
-      <Btn full tone="navy" onClick={save} disabled={!incomingGuard.trim()}>Submit Handover</Btn>
+      <Btn full tone="navy" onClick={save} disabled={!chosenGuard}>Submit Handover</Btn>
     </Modal>
   );
 }
@@ -4520,7 +4464,7 @@ function IncidentsScreen({ session, incidents, persistIncidents, settings, persi
   return (
     <div>
       <SectionTitle title="Incident Reports" sub={`${open.length} open`} action={{ label: "+ Report Incident", onClick: () => setShowForm(true) }} />
-      {session.role === "admin" && (
+      {isMgmt(session) && (
         <button onClick={() => setAlertSettings(true)} style={{ background: "none", border: "none", color: C.navy, fontSize: 12, fontWeight: 600, cursor: "pointer", textDecoration: "underline", marginBottom: 12, display: "block" }}>
           Alert Settings
         </button>
@@ -4686,7 +4630,14 @@ function originLabel(code, custom) {
   const n = originName(c, custom);
   return n ? `${c} — ${n}` : c;
 }
-function shipRef(s) { return (s.arrival_no || s.awb || "—"); }
+// Two kinds of shipment record: individual ones (one arrival number each) and
+// "count only" ones (COUNT_IN / COUNT_OUT) that record how many, and who brought/took them.
+function isCountRecord(s) { return s.status === "COUNT_IN" || s.status === "COUNT_OUT"; }
+function shipQty(s) { return isCountRecord(s) ? (Number(s.quantity) || 0) : 1; }
+function sumQty(list) { return list.reduce((n, s) => n + shipQty(s), 0); }
+function isArrival(s) { return s.status !== "COUNT_OUT"; }
+function isRelease(s) { return s.status === "DISPATCHED" || s.status === "COUNT_OUT"; }
+function shipRef(s) { return isCountRecord(s) ? `${shipQty(s)} (count only)` : (s.arrival_no || s.awb || "—"); }
 function shipKey(s) { return String(s.arrival_no || s.awb || "").trim().toUpperCase(); }
 
 function shipmentAgeMs(s) {
@@ -4770,7 +4721,7 @@ function OriginField({ value, onChange, custom }) {
   );
 }
 
-function ShipmentsScreen({ session, shipments, persistShipments, settings, persistSettings, notify, sendReport }) {
+function ShipmentsScreen({ session, shipments, persistShipments, settings, persistSettings, notify, sendReport, getDb, firebaseMode, activeLocationId }) {
   const threshold = settings.shipment_threshold_days || 3;
   const custom = settings.origin_custom || {};
   const keys = dayKeys();
@@ -4783,6 +4734,10 @@ function ShipmentsScreen({ session, shipments, persistShipments, settings, persi
   const [noting, setNoting] = useState(null);
   const [showThreshold, setShowThreshold] = useState(false);
   const [showCodes, setShowCodes] = useState(false);
+  const [showCount, setShowCount] = useState(null); // "IN" | "OUT" | null
+  const [damageFor, setDamageFor] = useState(null);
+  const [photosOf, setPhotosOf] = useState(null);
+  const [onlyDamaged, setOnlyDamaged] = useState(false);
 
   const inWh = useMemo(() => shipments.filter((s) => s.status === "IN_WAREHOUSE").sort((a, b) => (a.date_in + a.time_in).localeCompare(b.date_in + b.time_in)), [shipments]);
   const overdue = inWh.filter((s) => shipmentState(s, threshold) === "OVERDUE");
@@ -4794,18 +4749,18 @@ function ShipmentsScreen({ session, shipments, persistShipments, settings, persi
   ].filter((x) => x[2] > 0);
 
   const inMode = (s, bucket, m) => {
-    if (m === "arrived") return inDayBucket(s.date_in, bucket, keys);
-    if (m === "released") return s.status === "DISPATCHED" && inDayBucket(s.date_out, bucket, keys);
+    if (m === "arrived") return isArrival(s) && inDayBucket(s.date_in, bucket, keys);
+    if (m === "released") return isRelease(s) && inDayBucket(s.date_out, bucket, keys);
     return s.status === "IN_WAREHOUSE" && inDayBucket(s.date_in, bucket, keys);
   };
-  const countFor = (bucket, m) => shipments.filter((s) => inMode(s, bucket, m)).length;
+  const countFor = (bucket, m) => sumQty(shipments.filter((s) => inMode(s, bucket, m)));
 
   const matches = (s) => {
     if (!q.trim()) return true;
     const t = q.toLowerCase();
-    return [s.arrival_no, s.awb, s.origin, originName(s.origin, custom), s.brought_by_name, s.brought_by_id, s.taken_by_name, s.taken_by_id, s.destination].some((v) => (v || "").toLowerCase().includes(t));
+    return [s.arrival_no, s.awb, s.origin, originName(s.origin, custom), s.brought_by_name, s.brought_by_id, s.taken_by_name, s.taken_by_id, s.destination, s.damage_notes].some((v) => (v || "").toLowerCase().includes(t));
   };
-  const list = shipments.filter((s) => inMode(s, day, mode)).filter(matches).sort((a, b) => {
+  const list = shipments.filter((s) => inMode(s, day, mode)).filter(matches).filter((s) => !onlyDamaged || s.damaged).sort((a, b) => {
     if (mode === "remaining") return (a.date_in + a.time_in).localeCompare(b.date_in + b.time_in);
     if (mode === "released") return ((b.date_out || "") + (b.time_out || "")).localeCompare((a.date_out || "") + (a.time_out || ""));
     return (b.date_in + b.time_in).localeCompare(a.date_in + a.time_in);
@@ -4819,13 +4774,81 @@ function ShipmentsScreen({ session, shipments, persistShipments, settings, persi
     hold_notes: [], created_at: Date.now(), updated_at: Date.now(),
   });
 
+  // Damage photos live in their own collection (read only when someone opens them),
+  // so the shipment list stays light. Photos need Firebase mode.
+  const photoBase = () => (activeLocationId ? `locations/${activeLocationId}/shipmentPhotos` : null);
+  const uploadPhotos = async (shipmentId, photos) => {
+    if (!photos || photos.length === 0) return [];
+    const db = getDb && getDb();
+    const base = photoBase();
+    if (!firebaseMode || !db || !base) {
+      const msg = "Damage photos can only be saved when connected to Firebase.";
+      notify(msg, "error");
+      throw new Error(msg);
+    }
+    const ids = [];
+    try {
+      for (const image of photos) {
+        const pid = uid("sp_");
+        await db.doc(`${base}/${pid}`).set({ id: pid, shipment_id: shipmentId, image, created_at: Date.now() });
+        ids.push(pid);
+      }
+    } catch (e) {
+      console.error("Damage photo upload failed:", e);
+      notify(describeFirestoreError(e, "save the damage photos"), "error");
+      throw e;
+    }
+    return ids;
+  };
+
   const receive = async (data) => {
     const now = new Date();
-    const { backdateDate, backdateTime, ...fields } = data;
-    const rec = { id: uid("sh_"), ...baseRecord(now, fields, backdateDate, backdateTime) };
+    const { backdateDate, backdateTime, photos, ...fields } = data;
+    const id = uid("sh_");
+    const photo_ids = fields.damaged ? await uploadPhotos(id, photos) : [];
+    const rec = {
+      id, ...baseRecord(now, fields, backdateDate, backdateTime),
+      damaged: !!fields.damaged, damage_notes: fields.damaged ? (fields.damage_notes || "") : "", photo_ids,
+      damage_reported_by: fields.damaged ? session.name : "",
+    };
     await persistShipments([rec, ...shipments]);
     setShowReceive(false);
-    notify(`Shipment ${shipRef(rec)} received`);
+    setDay("today"); setMode("arrived"); // so the new shipment is visible right away
+    notify(`Shipment ${shipRef(rec)} received${rec.damaged ? " — damage recorded" : ""}`);
+  };
+
+  // "Count only": how many came in / went out, with the person and their ID — no arrival numbers.
+  const addCount = async (data) => {
+    const now = new Date();
+    const { direction, backdateDate, backdateTime, ...f } = data;
+    const date = backdateDate || todayStr(now);
+    const time = backdateTime ? `${backdateTime}:00` : nowTimeStr(now);
+    const common = {
+      id: uid("sh_"), quantity: f.quantity, arrival_no: "", awb: "", damaged: false, damage_notes: "", photo_ids: [],
+      date_in: date, time_in: time, hold_notes: [], created_at: Date.now(), updated_at: Date.now(),
+      taken_by_company: "", taken_by_phone: "",
+    };
+    const rec = direction === "IN"
+      ? { ...common, status: "COUNT_IN", origin: (f.origin || "").toUpperCase(), brought_by_name: f.brought_by_name, brought_by_id: f.brought_by_id, remarks_in: f.remarks_in || "",
+          received_by: session.name, date_out: null, time_out: null, taken_by_name: "", taken_by_id: "", destination: "", released_by: null, remarks_out: "" }
+      : { ...common, status: "COUNT_OUT", origin: "", brought_by_name: "", brought_by_id: "", remarks_in: "",
+          received_by: "", date_out: date, time_out: time, taken_by_name: f.taken_by_name, taken_by_id: f.taken_by_id, destination: f.destination, released_by: session.name, remarks_out: f.remarks_out || "" };
+    await persistShipments([rec, ...shipments]);
+    setShowCount(null);
+    setDay("today"); setMode(direction === "IN" ? "arrived" : "released");
+    notify(`${rec.quantity} shipment${rec.quantity === 1 ? "" : "s"} ${direction === "IN" ? "received" : "released"} (count only)`);
+  };
+
+  // Damage found after arrival: needs the arrival number, a description and photos.
+  const reportDamage = async (shipment, { arrival_no, damage_notes, photos }) => {
+    const ids = await uploadPhotos(shipment.id, photos);
+    const updated = {
+      ...shipment, arrival_no: arrival_no || shipment.arrival_no, damaged: true, damage_notes,
+      photo_ids: [...(shipment.photo_ids || []), ...ids], damage_reported_by: session.name, updated_at: Date.now(),
+    };
+    await persistShipments(shipments.map((x) => (x.id === shipment.id ? updated : x)));
+    setDamageFor(null);
+    notify(`Damage recorded for ${shipRef(updated)}`);
   };
 
   const receiveBulk = async (items, shared) => {
@@ -4864,6 +4887,7 @@ function ShipmentsScreen({ session, shipments, persistShipments, settings, persi
     const dk = dayKeys();
     const headers = [
       { label: "Arrival No.", get: (r) => r.arrival_no || "" }, { label: "AWB", get: (r) => r.awb || "" }, { label: "Status", get: (r) => r.status },
+      { label: "Type", get: (r) => (isCountRecord(r) ? "Count only" : "Individual") }, { label: "Quantity", get: (r) => shipQty(r) },
       { label: "Origin Code", get: (r) => r.origin || "" }, { label: "Origin", get: (r) => originName(r.origin, custom) },
       { label: "Arrived Date", get: (r) => r.date_in }, { label: "Arrived Day", get: (r) => dayLabelFor(r.date_in, dk) }, { label: "Time In", get: (r) => r.time_in },
       { label: "Brought By", get: (r) => r.brought_by_name }, { label: "Brought By ID", get: (r) => r.brought_by_id || "" },
@@ -4871,12 +4895,14 @@ function ShipmentsScreen({ session, shipments, persistShipments, settings, persi
       { label: "Destination", get: (r) => r.destination || "" },
       { label: "Taken By (Staff)", get: (r) => r.taken_by_name }, { label: "Staff Number", get: (r) => r.taken_by_id || "" },
       { label: "Days in Warehouse", get: (r) => {
+        if (isCountRecord(r)) return "";
         const end = r.status === "DISPATCHED" ? new Date(`${r.date_out}T${r.time_out}`).getTime() : Date.now();
         return (Math.max(0, end - new Date(`${r.date_in}T${r.time_in}`).getTime()) / 86400000).toFixed(1);
       } },
       { label: "Why Still Here (notes)", get: (r) => (r.hold_notes || []).map((n) => `${n.date} ${n.by}: ${n.text}`).join(" | ") },
       { label: "Remarks In", get: (r) => r.remarks_in || "" }, { label: "Remarks Out", get: (r) => r.remarks_out || "" },
       { label: "Logged In By (system)", get: (r) => r.received_by || "" }, { label: "Logged Out By (system)", get: (r) => r.released_by || "" },
+      { label: "Damaged", get: (r) => (r.damaged ? "Yes" : "") }, { label: "Damage Notes", get: (r) => r.damage_notes || "" }, { label: "Damage Photos", get: (r) => (r.photo_ids || []).length || "" },
     ];
     downloadFile(`shipments-${todayStr()}.csv`, toCSV(shipments, headers), "text/csv");
   };
@@ -4894,11 +4920,15 @@ function ShipmentsScreen({ session, shipments, persistShipments, settings, persi
 
       <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 10 }}>
         <Btn size="sm" tone="navy" icon={Camera} onClick={() => setShowScan(true)}>Scan / Paste Manifest</Btn>
+        <Btn size="sm" tone="paper" icon={DoorOpen} onClick={() => setShowCount("IN")}>Receive by count</Btn>
+        <Btn size="sm" tone="paper" icon={DoorClosed} onClick={() => setShowCount("OUT")}>Release by count</Btn>
         <Btn size="sm" tone="paper" icon={FileDown} onClick={() => sendReport("shipments", "daily")}>Send Day Report to Manager</Btn>
+        <Btn size="sm" tone="paper" icon={FileDown} onClick={() => sendReport("shipments", "weekly")}>Send Week Report</Btn>
+        <Btn size="sm" tone="paper" icon={FileDown} onClick={() => sendReport("shipments", "monthly")}>Send Month Report</Btn>
       </div>
       <div style={{ display: "flex", gap: 14, alignItems: "center", marginBottom: 12, flexWrap: "wrap" }}>
         <span style={{ fontSize: 12.5, color: C.ink50 }}>Flag after <b style={{ color: C.ink }}>{threshold} day{threshold === 1 ? "" : "s"}</b> in warehouse</span>
-        {session.role === "admin" && (
+        {isMgmt(session) && (
           <>
             <button onClick={() => setShowThreshold(true)} style={{ background: "none", border: "none", color: C.navy, fontSize: 12, fontWeight: 600, cursor: "pointer", textDecoration: "underline", padding: 0 }}>Change</button>
             <button onClick={() => setShowCodes(true)} style={{ background: "none", border: "none", color: C.navy, fontSize: 12, fontWeight: 600, cursor: "pointer", textDecoration: "underline", padding: 0 }}>Origin codes</button>
@@ -4957,8 +4987,13 @@ function ShipmentsScreen({ session, shipments, persistShipments, settings, persi
         <input style={{ ...inputStyle, paddingLeft: 32 }} placeholder="Search arrival no., origin, name, ID, destination…" value={q} onChange={(e) => setQ(e.target.value)} />
       </div>
 
+      {(shipments.some((x) => x.damaged) || onlyDamaged) && (
+        <button onClick={() => setOnlyDamaged((v) => !v)} style={{ marginBottom: 10, padding: "5px 11px", borderRadius: 16, fontSize: 12, fontWeight: 600, cursor: "pointer", border: `1px solid ${onlyDamaged ? C.red : C.line}`, background: onlyDamaged ? C.red : "#fff", color: onlyDamaged ? "#fff" : C.ink }}>
+          Damaged only ({shipments.filter((x) => x.damaged).length})
+        </button>
+      )}
       <div style={{ fontSize: 12, color: C.ink50, marginBottom: 8 }}>
-        Showing: {mode === "arrived" ? "received" : mode === "released" ? "released" : "still in warehouse, arrived"} — <b style={{ color: C.ink }}>{dayName}</b> ({list.length})
+        Showing: {mode === "arrived" ? "received" : mode === "released" ? "released" : "still in warehouse, arrived"} — <b style={{ color: C.ink }}>{dayName}</b> ({sumQty(list)})
         {mode === "released" && day !== "all" ? " · each shows the day it arrived" : ""}
       </div>
 
@@ -4966,6 +5001,34 @@ function ShipmentsScreen({ session, shipments, persistShipments, settings, persi
         {list.length === 0 ? (
           <EmptyState icon={Truck} title="Nothing here" sub={day === "older" ? "No older records — tracking starts from the first day you use this." : "No shipments match this day and view."} />
         ) : list.map((s) => {
+          if (isCountRecord(s)) {
+            const isIn = s.status === "COUNT_IN";
+            const qty = shipQty(s);
+            return (
+              <div key={s.id} style={{ background: "#fff", border: `1px solid ${C.line}`, borderLeft: `4px solid ${isIn ? C.navy : C.green}`, borderRadius: 10, padding: "12px 14px" }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+                  <span style={{ fontFamily: FONT_SERIF, fontSize: 24, fontWeight: 800, color: C.ink, lineHeight: 1 }}>{qty}</span>
+                  <span style={{ fontSize: 13.5, fontWeight: 600, color: C.ink }}>shipment{qty === 1 ? "" : "s"} {isIn ? "received" : "released"}</span>
+                  <Badge tone="neutral">COUNT ONLY</Badge>
+                </div>
+                {isIn ? (
+                  <>
+                    {s.origin && <div style={{ fontSize: 12.5, color: C.navy, fontWeight: 600, marginTop: 5 }}>From: {originLabel(s.origin, custom)}</div>}
+                    <div style={{ fontSize: 12.5, color: C.ink, marginTop: 5 }}><b>Brought by:</b> {s.brought_by_name || "—"}{s.brought_by_id ? ` · ID ${s.brought_by_id}` : ""}</div>
+                    <div style={{ fontSize: 11.5, color: C.ink50, marginTop: 2 }}>Received {fmtDate(s.date_in)} {fmtTime(s.time_in)}{s.remarks_in ? ` · ${s.remarks_in}` : ""}</div>
+                    <div style={{ fontSize: 11.5, color: C.ink50, marginTop: 2 }}>Logged by {s.received_by || "—"}</div>
+                  </>
+                ) : (
+                  <>
+                    <div style={{ fontSize: 12.5, color: C.ink, marginTop: 5 }}><b>Taken by:</b> {s.taken_by_name || "—"}{s.taken_by_id ? ` · ID ${s.taken_by_id}` : ""}</div>
+                    {s.destination && <div style={{ fontSize: 12.5, color: C.navy, fontWeight: 600, marginTop: 2 }}>Taken to: {s.destination}</div>}
+                    <div style={{ fontSize: 11.5, color: C.ink50, marginTop: 2 }}>Released {fmtDate(s.date_out)} {fmtTime(s.time_out)}{s.remarks_out ? ` · ${s.remarks_out}` : ""}</div>
+                    <div style={{ fontSize: 11.5, color: C.ink50, marginTop: 2 }}>Logged by {s.released_by || "—"}</div>
+                  </>
+                )}
+              </div>
+            );
+          }
           const st = shipmentState(s, threshold);
           const border = st === "OVERDUE" ? "#FECACA" : st === "DUE_SOON" ? "#FDE68A" : C.line;
           const notes = s.hold_notes || [];
@@ -4981,8 +5044,14 @@ function ShipmentsScreen({ session, shipments, persistShipments, settings, persi
                     {st === "OK" && <Badge tone="inside">IN WAREHOUSE</Badge>}
                     {st === "DISPATCHED" && <Badge tone="out">RELEASED {dayLabelFor(s.date_out, keys).toUpperCase()}</Badge>}
                     <Badge tone="neutral">ARRIVED {dayLabelFor(s.date_in, keys).toUpperCase()}</Badge>
+                    {s.damaged && <Badge tone="missing">DAMAGED</Badge>}
                   </div>
                   {s.arrival_no && s.awb && <div style={{ fontSize: 11.5, color: C.ink50, marginTop: 3, fontFamily: FONT_MONO }}>AWB {s.awb}</div>}
+                  {s.damaged && (
+                    <div style={{ fontSize: 12.5, color: C.redDeep, background: "#FDE8E8", border: "1px solid #F5B5B5", borderRadius: 6, padding: "6px 9px", marginTop: 6 }}>
+                      <b>Damaged:</b> {s.damage_notes || "no description"}{s.damage_reported_by ? ` — reported by ${s.damage_reported_by}` : ""}
+                    </div>
+                  )}
                   {from && <div style={{ fontSize: 12.5, color: C.navy, fontWeight: 600, marginTop: 4 }}>From: {from}</div>}
                   <div style={{ fontSize: 12.5, color: C.ink, marginTop: 5 }}>
                     <b>Brought by:</b> {s.brought_by_name || "—"}{s.brought_by_id ? ` · ID ${s.brought_by_id}` : ""}
@@ -5019,10 +5088,12 @@ function ShipmentsScreen({ session, shipments, persistShipments, settings, persi
                     </div>
                   )}
                 </div>
-                {s.status === "IN_WAREHOUSE" && (
+                {(s.status === "IN_WAREHOUSE" || (s.damaged && (s.photo_ids || []).length > 0)) && (
                   <div style={{ display: "flex", flexDirection: "column", gap: 6, flexShrink: 0 }}>
-                    <Btn size="sm" tone="red" icon={DoorClosed} onClick={() => setReleasing(s)}>Release</Btn>
-                    <Btn size="sm" tone="paper" icon={Edit3} onClick={() => setNoting(s)}>Add reason</Btn>
+                    {s.status === "IN_WAREHOUSE" && <Btn size="sm" tone="red" icon={DoorClosed} onClick={() => setReleasing(s)}>Release</Btn>}
+                    {s.status === "IN_WAREHOUSE" && <Btn size="sm" tone="paper" icon={Edit3} onClick={() => setNoting(s)}>Add reason</Btn>}
+                    {s.status === "IN_WAREHOUSE" && !s.damaged && <Btn size="sm" tone="paper" icon={AlertTriangle} onClick={() => setDamageFor(s)}>Report damage</Btn>}
+                    {s.damaged && (s.photo_ids || []).length > 0 && <Btn size="sm" tone="paper" icon={Eye} onClick={() => setPhotosOf(s)}>Photos ({(s.photo_ids || []).length})</Btn>}
                   </div>
                 )}
               </div>
@@ -5031,9 +5102,13 @@ function ShipmentsScreen({ session, shipments, persistShipments, settings, persi
         })}
       </div>
 
-      {showScan && <ManifestScanModal existing={shipments} custom={custom} onClose={() => setShowScan(false)} onSave={receiveBulk} canBackdate={session.role === "admin"} />}
-      {showReceive && <ShipmentReceiveForm existing={shipments} custom={custom} onClose={() => setShowReceive(false)} onSave={receive} canBackdate={session.role === "admin"} />}
-      {releasing && <ShipmentReleaseForm shipment={releasing} onClose={() => setReleasing(null)} onSave={(data) => release(releasing, data)} canBackdate={session.role === "admin"} />}
+      {showScan && <ManifestScanModal existing={shipments} custom={custom} onClose={() => setShowScan(false)} onSave={receiveBulk} canBackdate={isMgmt(session)} />}
+      {showReceive && <ShipmentReceiveForm existing={shipments} custom={custom} onClose={() => setShowReceive(false)} onSave={receive} canBackdate={isMgmt(session)}
+        photosEnabled={!!firebaseMode} onSwitchToCount={() => { setShowReceive(false); setShowCount("IN"); }} />}
+      {showCount && <ShipmentCountForm direction={showCount} custom={custom} onClose={() => setShowCount(null)} onSave={addCount} canBackdate={isMgmt(session)} />}
+      {damageFor && <ShipmentDamageModal shipment={damageFor} photosEnabled={!!firebaseMode} onClose={() => setDamageFor(null)} onSave={(d) => reportDamage(damageFor, d)} />}
+      {photosOf && <ShipmentPhotosModal shipment={photosOf} getDb={getDb} base={photoBase()} onClose={() => setPhotosOf(null)} />}
+      {releasing && <ShipmentReleaseForm shipment={releasing} onClose={() => setReleasing(null)} onSave={(data) => release(releasing, data)} canBackdate={isMgmt(session)} />}
       {noting && <ShipmentNoteModal shipment={noting} onClose={() => setNoting(null)} onSave={(text) => addNote(noting, text)} />}
       {showThreshold && <ShipmentThresholdModal settings={settings} persistSettings={persistSettings} notify={notify} onClose={() => setShowThreshold(false)} />}
       {showCodes && <ShipmentOriginCodesModal settings={settings} persistSettings={persistSettings} notify={notify} onClose={() => setShowCodes(false)} />}
@@ -5447,13 +5522,58 @@ function ManifestScanModal({ existing, custom, onClose, onSave, canBackdate }) {
   );
 }
 
-function ShipmentReceiveForm({ existing, custom, onClose, onSave, canBackdate }) {
+function PhotoPicker({ photos, setPhotos, max = 4, label }) {
+  const ref = useRef(null);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+  const onPick = async (e) => {
+    const file = e.target.files && e.target.files[0];
+    e.target.value = "";
+    if (!file) return;
+    setErr(""); setBusy(true);
+    try {
+      const url = await compressImageFile(file);
+      setPhotos((p) => [...p, url].slice(0, max));
+    } catch (x) {
+      setErr((x && x.message) || "Could not read this photo.");
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <div style={{ marginBottom: 12 }}>
+      <input ref={ref} type="file" accept="image/*" capture="environment" onChange={onPick} style={{ display: "none" }} data-testid="damage-photo-input" />
+      {photos.length > 0 && (
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 8 }}>
+          {photos.map((p, i) => (
+            <div key={i} style={{ position: "relative" }}>
+              <img src={p} alt={`Damage ${i + 1}`} style={{ width: 72, height: 72, objectFit: "cover", borderRadius: 8, border: `1px solid ${C.line}` }} />
+              <button type="button" aria-label="Remove photo" onClick={() => setPhotos((arr) => arr.filter((_, j) => j !== i))}
+                style={{ position: "absolute", top: -6, right: -6, width: 20, height: 20, borderRadius: 10, border: "none", background: C.red, color: "#fff", cursor: "pointer", fontSize: 12, lineHeight: "20px", padding: 0 }}>×</button>
+            </div>
+          ))}
+        </div>
+      )}
+      <Btn size="sm" tone="paper" icon={Camera} onClick={() => ref.current && ref.current.click()} disabled={busy || photos.length >= max}>
+        {busy ? "Processing…" : photos.length >= max ? `Maximum ${max} photos` : (label || "Add photo")}
+      </Btn>
+      {err && <div style={{ fontSize: 12, color: C.redDeep, marginTop: 6 }}>{err}</div>}
+    </div>
+  );
+}
+
+function ShipmentReceiveForm({ existing, custom, onClose, onSave, canBackdate, photosEnabled, onSwitchToCount }) {
   const [arrival, setArrival] = useState("");
   const [awb, setAwb] = useState("");
   const [origin, setOrigin] = useState("");
   const [name, setName] = useState("");
   const [idCard, setIdCard] = useState("");
   const [remarks, setRemarks] = useState("");
+  const [damaged, setDamaged] = useState(false);
+  const [damageNotes, setDamageNotes] = useState("");
+  const [photos, setPhotos] = useState([]);
+  const [saving, setSaving] = useState(false);
+  const [formErr, setFormErr] = useState("");
   // Only admins may record a past date/time; everyone else is stamped with the current time.
   const [backdate, setBackdateRaw] = useState(false);
   const setBackdate = (v) => setBackdateRaw(canBackdate ? v : false);
@@ -5462,20 +5582,37 @@ function ShipmentReceiveForm({ existing, custom, onClose, onSave, canBackdate })
   const [bdError, setBdError] = useState("");
   const [err, setErr] = useState("");
 
-  const save = () => {
+  const save = async () => {
     const arr = arrival.trim().toUpperCase(), aw = awb.trim().toUpperCase();
     const key = arr || aw;
+    setFormErr("");
     if (!key || !name.trim()) return;
     if (existing.some((s) => s.status === "IN_WAREHOUSE" && shipKey(s) === key)) { setErr("This one is already in the warehouse — release it first or check the number."); return; }
+    if (damaged) {
+      if (!arr) { setFormErr("A damaged shipment must have its Arrival Number written in."); return; }
+      if (!damageNotes.trim()) { setFormErr("Describe what is damaged."); return; }
+      if (photosEnabled && photos.length === 0) { setFormErr("Add at least one photo of the damage."); return; }
+    }
     if (backdate && new Date(`${bdDate}T${bdTime}:00`).getTime() > Date.now() + 60000) { setBdError("That date/time is in the future"); return; }
-    onSave({
-      arrival_no: arr, awb: aw, origin: origin.trim().toUpperCase(), brought_by_name: name.trim(), brought_by_id: idCard.trim(),
-      remarks_in: remarks.trim(), backdateDate: backdate ? bdDate : null, backdateTime: backdate ? bdTime : null,
-    });
+    setSaving(true);
+    try {
+      await onSave({
+        arrival_no: arr, awb: aw, origin: origin.trim().toUpperCase(), brought_by_name: name.trim(), brought_by_id: idCard.trim(),
+        remarks_in: remarks.trim(), backdateDate: backdate ? bdDate : null, backdateTime: backdate ? bdTime : null,
+        damaged, damage_notes: damaged ? damageNotes.trim() : "", photos: damaged ? photos : [],
+      });
+    } catch (e) {
+      setSaving(false); // the failed save already showed an error message
+    }
   };
 
   return (
     <Modal title="Receive Shipment" onClose={onClose}>
+      {onSwitchToCount && (
+        <button type="button" onClick={onSwitchToCount} style={{ background: "none", border: "none", color: C.navy, fontSize: 12.5, fontWeight: 600, cursor: "pointer", textDecoration: "underline", padding: 0, marginBottom: 14, display: "block" }}>
+          No arrival numbers? Record by count instead →
+        </button>
+      )}
       <Field label="Arrival Number"><input autoFocus style={{ ...inputStyle, fontFamily: FONT_MONO }} value={arrival} onChange={(e) => { setArrival(e.target.value); setErr(""); }} placeholder="e.g. 1042215" autoCapitalize="characters" /></Field>
       {err && <div style={{ fontSize: 12.5, color: C.redDeep, marginTop: -6, marginBottom: 10 }}>{err}</div>}
       <Field label="AWB Number (optional)"><input style={{ ...inputStyle, fontFamily: FONT_MONO }} value={awb} onChange={(e) => { setAwb(e.target.value); setErr(""); }} placeholder="e.g. 176-48201935" autoCapitalize="characters" /></Field>
@@ -5483,13 +5620,163 @@ function ShipmentReceiveForm({ existing, custom, onClose, onSave, canBackdate })
       <Field label="Brought By (person's name)"><input style={inputStyle} value={name} onChange={(e) => setName(e.target.value)} /></Field>
       <Field label="Their ID Number"><input style={inputStyle} value={idCard} onChange={(e) => setIdCard(e.target.value)} /></Field>
       <Field label="Remarks (optional)"><input style={inputStyle} value={remarks} onChange={(e) => setRemarks(e.target.value)} placeholder="e.g. 2 cartons, fragile" /></Field>
+
+      <div style={{ marginBottom: 14 }}>
+        <button type="button" onClick={() => setDamaged((v) => !v)} aria-pressed={damaged} style={{
+          display: "flex", alignItems: "center", gap: 8, width: "100%", textAlign: "left", cursor: "pointer", padding: "10px 12px", borderRadius: 8, fontSize: 13.5, fontWeight: 700, fontFamily: FONT_SANS,
+          border: `2px solid ${damaged ? C.red : C.line}`, background: damaged ? "#FDE8E8" : "#fff", color: damaged ? C.redDeep : C.ink,
+        }}>
+          <AlertTriangle size={16} /> {damaged ? "Damaged shipment — details below" : "Is this shipment damaged?"}
+        </button>
+        {damaged && (
+          <div style={{ border: "1px solid #F5B5B5", borderTop: "none", borderRadius: "0 0 8px 8px", padding: 12, background: "#FFF8F8" }}>
+            <div style={{ fontSize: 12, color: C.redDeep, marginBottom: 8, lineHeight: 1.5 }}>The <b>Arrival Number is required</b> for a damaged shipment{photosEnabled ? ", with at least one photo" : ""}.</div>
+            <Field label="What is damaged?"><input style={inputStyle} value={damageNotes} onChange={(e) => setDamageNotes(e.target.value)} placeholder="e.g. carton crushed, contents wet" /></Field>
+            {photosEnabled ? <PhotoPicker photos={photos} setPhotos={setPhotos} label="Add photo of the damage" /> : <div style={{ fontSize: 12, color: C.ink50 }}>Photos can only be saved when connected to Firebase.</div>}
+          </div>
+        )}
+      </div>
+
       {canBackdate ? (
         <BackdateDateTime label="Arrived earlier? Set the real date & time" active={backdate} setActive={setBackdate}
           date={bdDate} setDate={setBdDate} time={bdTime} setTime={setBdTime} error={bdError} setError={setBdError} />
       ) : (
         <div style={{ fontSize: 12, color: C.ink50, marginBottom: 14 }}>Recorded at the current time automatically.</div>
       )}
-      <Btn full tone="green" icon={DoorOpen} onClick={save} disabled={!(arrival.trim() || awb.trim()) || !name.trim()}>Receive into Warehouse</Btn>
+      {formErr && <div style={{ background: "#FDE8E8", border: "1px solid #F5B5B5", borderRadius: 8, padding: "9px 12px", fontSize: 13, color: C.redDeep, marginBottom: 12 }}>{formErr}</div>}
+      <Btn full tone="green" icon={DoorOpen} onClick={save} disabled={saving || !(arrival.trim() || awb.trim()) || !name.trim()}>{saving ? "Saving…" : "Receive into Warehouse"}</Btn>
+    </Modal>
+  );
+}
+
+// Count-only entry: no arrival numbers, just how many, who, their ID, and (for OUT) where to.
+function ShipmentCountForm({ direction, custom, onClose, onSave, canBackdate }) {
+  const isIn = direction === "IN";
+  const [qty, setQty] = useState("");
+  const [origin, setOrigin] = useState("");
+  const [name, setName] = useState("");
+  const [idNo, setIdNo] = useState("");
+  const [destination, setDestination] = useState("");
+  const [remarks, setRemarks] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+  const [backdate, setBackdateRaw] = useState(false);
+  const setBackdate = (v) => setBackdateRaw(canBackdate ? v : false);
+  const [bdDate, setBdDate] = useState(todayStr());
+  const [bdTime, setBdTime] = useState(nowTimeStr().slice(0, 5));
+  const [bdError, setBdError] = useState("");
+
+  const save = async () => {
+    const n = Number(qty);
+    if (!Number.isInteger(n) || n < 1) { setError("Enter how many shipments (a whole number, 1 or more)."); return; }
+    if (!name.trim()) { setError(isIn ? "Enter the name of the person who brought them." : "Enter the name of the person taking them."); return; }
+    if (!idNo.trim()) { setError(isIn ? "Enter that person's ID number." : "Enter that person's ID / staff number."); return; }
+    if (!isIn && !destination.trim()) { setError("Enter where the shipments are going."); return; }
+    if (backdate && new Date(`${bdDate}T${bdTime}:00`).getTime() > Date.now() + 60000) { setBdError("That date/time is in the future"); return; }
+    setError(""); setSaving(true);
+    try {
+      await onSave(isIn
+        ? { direction, quantity: n, brought_by_name: name.trim(), brought_by_id: idNo.trim(), origin: origin.trim().toUpperCase(), remarks_in: remarks.trim(), backdateDate: backdate ? bdDate : null, backdateTime: backdate ? bdTime : null }
+        : { direction, quantity: n, taken_by_name: name.trim(), taken_by_id: idNo.trim(), destination: destination.trim(), remarks_out: remarks.trim(), backdateDate: backdate ? bdDate : null, backdateTime: backdate ? bdTime : null });
+    } catch (e) {
+      setSaving(false); // the failed save already showed an error message
+    }
+  };
+
+  return (
+    <Modal title={isIn ? "Receive by count" : "Release by count"} onClose={onClose}>
+      <div style={{ fontSize: 12.5, color: C.ink50, marginBottom: 12, lineHeight: 1.5 }}>
+        {isIn ? "Use this when the arrival numbers are not written down: record how many shipments came in and who brought them."
+              : "Record how many shipments are leaving, where they are going and who is taking them."}
+      </div>
+      <Field label="Number of shipments *"><input autoFocus type="number" min="1" step="1" inputMode="numeric" style={{ ...inputStyle, fontSize: 18, fontWeight: 700 }} value={qty} onChange={(e) => setQty(e.target.value)} /></Field>
+      {isIn ? (
+        <OriginField value={origin} onChange={setOrigin} custom={custom} />
+      ) : (
+        <div style={{ marginBottom: 12 }} role="group" aria-label="Going to">
+          <div style={{ fontSize: 12.5, fontFamily: FONT_SANS, fontWeight: 600, color: C.ink50, marginBottom: 5 }}>Going to *</div>
+          <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 6 }}>
+            {["Dubai", "Abu Dhabi", "Jebel Ali"].map((d) => (
+              <button type="button" key={d} onClick={() => setDestination(d)} style={{ padding: "5px 10px", borderRadius: 16, fontSize: 12.5, cursor: "pointer", border: `1px solid ${destination === d ? C.navy : C.line}`, background: destination === d ? C.navy : "#fff", color: destination === d ? "#fff" : C.ink }}>{d}</button>
+            ))}
+          </div>
+          <input aria-label="Going to (type a place)" style={inputStyle} value={destination} onChange={(e) => setDestination(e.target.value)} placeholder="Choose above or type a place" />
+        </div>
+      )}
+      <Field label={isIn ? "Brought by (person's name) *" : "Taken by (person's name) *"}><input style={inputStyle} value={name} onChange={(e) => setName(e.target.value)} /></Field>
+      <Field label={isIn ? "Their ID number *" : "Their ID / staff number *"}><input style={inputStyle} value={idNo} onChange={(e) => setIdNo(e.target.value)} /></Field>
+      <Field label="Remarks (optional)"><input style={inputStyle} value={remarks} onChange={(e) => setRemarks(e.target.value)} /></Field>
+      {canBackdate ? (
+        <BackdateDateTime label={isIn ? "Arrived earlier? Set the real date & time" : "Already left? Set the real date & time"} active={backdate} setActive={setBackdate}
+          date={bdDate} setDate={setBdDate} time={bdTime} setTime={setBdTime} error={bdError} setError={setBdError} />
+      ) : (
+        <div style={{ fontSize: 12, color: C.ink50, marginBottom: 14 }}>Recorded at the current time automatically.</div>
+      )}
+      {error && <div style={{ background: "#FDE8E8", border: "1px solid #F5B5B5", borderRadius: 8, padding: "9px 12px", fontSize: 13, color: C.redDeep, marginBottom: 12 }}>{error}</div>}
+      <Btn full tone={isIn ? "green" : "red"} icon={isIn ? DoorOpen : DoorClosed} onClick={save} disabled={saving}>{saving ? "Saving…" : isIn ? "Save received count" : "Save released count"}</Btn>
+    </Modal>
+  );
+}
+
+// Damage found after the shipment arrived: arrival number, description and photos are required.
+function ShipmentDamageModal({ shipment, photosEnabled, onClose, onSave }) {
+  const [arrival, setArrival] = useState(shipment.arrival_no || "");
+  const [notes, setNotes] = useState("");
+  const [photos, setPhotos] = useState([]);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+
+  const save = async () => {
+    const arr = arrival.trim().toUpperCase();
+    if (!arr) { setError("A damaged shipment must have its Arrival Number written in."); return; }
+    if (!notes.trim()) { setError("Describe what is damaged."); return; }
+    if (photosEnabled && photos.length === 0) { setError("Add at least one photo of the damage."); return; }
+    setError(""); setSaving(true);
+    try {
+      await onSave({ arrival_no: arr, damage_notes: notes.trim(), photos });
+    } catch (e) {
+      setSaving(false); // the failed save already showed an error message
+    }
+  };
+
+  return (
+    <Modal title="Report damaged shipment" onClose={onClose}>
+      <div style={{ background: C.paperDim, borderRadius: 8, padding: "10px 12px", marginBottom: 14 }}>
+        <div style={{ fontFamily: FONT_MONO, fontWeight: 700, fontSize: 15 }}>{shipRef(shipment)}</div>
+        <div style={{ fontSize: 12, color: C.ink50 }}>received {fmtDate(shipment.date_in)} {fmtTime(shipment.time_in)}</div>
+      </div>
+      <Field label="Arrival Number *"><input style={{ ...inputStyle, fontFamily: FONT_MONO }} value={arrival} onChange={(e) => setArrival(e.target.value)} autoCapitalize="characters" /></Field>
+      <Field label="What is damaged? *"><input autoFocus style={inputStyle} value={notes} onChange={(e) => setNotes(e.target.value)} placeholder="e.g. carton crushed, contents wet" /></Field>
+      {photosEnabled ? <PhotoPicker photos={photos} setPhotos={setPhotos} label="Add photo of the damage" /> : <div style={{ fontSize: 12, color: C.ink50, marginBottom: 12 }}>Photos can only be saved when connected to Firebase.</div>}
+      {error && <div style={{ background: "#FDE8E8", border: "1px solid #F5B5B5", borderRadius: 8, padding: "9px 12px", fontSize: 13, color: C.redDeep, marginBottom: 12 }}>{error}</div>}
+      <Btn full tone="red" icon={AlertTriangle} onClick={save} disabled={saving}>{saving ? "Saving…" : "Save damage record"}</Btn>
+    </Modal>
+  );
+}
+
+function ShipmentPhotosModal({ shipment, getDb, base, onClose }) {
+  const [state, setState] = useState({ loading: true, images: [], error: "" });
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const db = getDb && getDb();
+        if (!db || !base) throw new Error("Photos are only available when connected to Firebase.");
+        const snaps = await Promise.all((shipment.photo_ids || []).map((id) => db.doc(`${base}/${id}`).get()));
+        if (!cancelled) setState({ loading: false, images: snaps.filter((x) => x.exists).map((x) => x.data().image), error: "" });
+      } catch (e) {
+        if (!cancelled) setState({ loading: false, images: [], error: describeFirestoreError(e, "load the photos") });
+      }
+    })();
+    return () => { cancelled = true; };
+  }, []);
+  return (
+    <Modal title={`Damage photos — ${shipRef(shipment)}`} onClose={onClose} wide>
+      {shipment.damage_notes && <div style={{ fontSize: 13, color: C.redDeep, marginBottom: 10 }}><b>Damaged:</b> {shipment.damage_notes}</div>}
+      {state.loading ? <div style={{ fontSize: 13, color: C.ink50 }}>Loading photos…</div>
+        : state.error ? <div style={{ fontSize: 13, color: C.redDeep }}>{state.error}</div>
+        : state.images.length === 0 ? <div style={{ fontSize: 13, color: C.ink50 }}>No photos found.</div>
+        : state.images.map((src, i) => <img key={i} src={src} alt={`Damage photo ${i + 1}`} style={{ width: "100%", borderRadius: 8, marginBottom: 10 }} />)}
     </Modal>
   );
 }
@@ -5650,7 +5937,7 @@ function LeaveScreen({ session, employees, empById, leaves, persistLeaves, notif
             {range}{l.reason ? ` — ${l.reason}` : ""} · recorded by {l.recorded_by}
           </div>
         </div>
-        {removable && session.role === "admin" && (
+        {removable && isMgmt(session) && (
           <button onClick={() => setConfirmDelete(l)} style={{ background: "none", border: "none", color: C.redDeep, cursor: "pointer", flexShrink: 0 }}><Trash2 size={15} /></button>
         )}
       </div>
@@ -6425,39 +6712,6 @@ function SettingsScreen({ settings, persistSettings, users, persistUsers, notify
       </div>
       )}
 
-      <div style={{ background: "#fff", border: `1px solid ${C.line}`, borderRadius: 10, padding: 16 }}>
-        <h3 style={{ fontFamily: FONT_SERIF, fontSize: 16, margin: "0 0 8px" }}>Data Management</h3>
-        <p style={{ fontSize: 13, color: C.ink50, marginTop: 0, marginBottom: 14 }}>
-          This app starts with your login accounts only — no fake employees or attendance. Use the options below only if
-          you want to load a sample dataset for testing, or wipe everything to start completely over.
-        </p>
-
-        <div style={{ marginBottom: 14 }}>
-          <div style={{ fontSize: 13.5, fontWeight: 600, marginBottom: 4 }}>Load sample data</div>
-          <div style={{ fontSize: 12, color: C.ink50, marginBottom: 8 }}>Replaces everything with 15 demo employees and sample attendance, for testing. Your real data (if any) will be lost.</div>
-          {!confirmSample ? (
-            <Btn tone="paper" icon={RefreshCw} onClick={() => setConfirmSample(true)}>Load Sample Data</Btn>
-          ) : (
-            <div style={{ display: "flex", gap: 8 }}>
-              <Btn tone="ghost" onClick={() => setConfirmSample(false)}>Cancel</Btn>
-              <Btn tone="amber" disabled={busy} onClick={async () => { await loadSample(); setConfirmSample(false); }}>{busy ? "Loading…" : "Confirm — Load Sample Data"}</Btn>
-            </div>
-          )}
-        </div>
-
-        <div>
-          <div style={{ fontSize: 13.5, fontWeight: 600, marginBottom: 4 }}>Erase everything — fresh start</div>
-          <div style={{ fontSize: 12, color: C.ink50, marginBottom: 8 }}>Permanently deletes all employees, attendance, and audit history. Your login accounts are kept so you can still sign in afterward.</div>
-          {!confirmErase ? (
-            <Btn tone="red" icon={Trash2} onClick={() => setConfirmErase(true)}>Erase Everything</Btn>
-          ) : (
-            <div style={{ display: "flex", gap: 8 }}>
-              <Btn tone="ghost" onClick={() => setConfirmErase(false)}>Cancel</Btn>
-              <Btn tone="red" disabled={busy} onClick={async () => { await eraseAll(); setConfirmErase(false); }}>{busy ? "Erasing…" : "Confirm — Erase Everything"}</Btn>
-            </div>
-          )}
-        </div>
-      </div>
     </div>
   );
 }
