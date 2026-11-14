@@ -17,12 +17,6 @@
 <script src="https://cdn.jsdelivr.net/npm/firebase@10/firebase-app-compat.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/firebase@10/firebase-auth-compat.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/firebase@10/firebase-firestore-compat.js"></script>
-
-<link rel="manifest" href="/aramex-gatehouse-system/manifest.json">
-<link rel="icon" type="image/png" sizes="192x192" href="/aramex-gatehouse-system/icon-192.png">
-<link rel="apple-touch-icon" href="/aramex-gatehouse-system/icon-192.png">
-<meta name="theme-color" content="#C8102E">
-
 </head>
 <body>
 <div id="root"><div id="boot-fallback">Loading Gatehouse Register…<br/><small>(needs an internet connection the first time, to load React)</small></div></div>
@@ -6474,19 +6468,5 @@ const root = ReactDOM.createRoot(rootEl);
 root.render(<App />);
 
 </script>
-
- <script>
-if ("serviceWorker" in navigator) {
-  window.addEventListener("load", function () {
-    navigator.serviceWorker.register(
-      "/aramex-gatehouse-system/sw.js",
-      { scope: "/aramex-gatehouse-system/" }
-    ).catch(function (error) {
-      console.error("Service worker registration failed:", error);
-    });
-  });
-}
-</script> 
-
 </body>
 </html>
